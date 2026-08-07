@@ -1,8 +1,20 @@
-// Pulls the latest combined.json out of the pipeline's GitHub Actions artifact, per the
-// 3-call REST sequence verified during this project's design phase:
-//   1. GET /repos/{owner}/{repo}/actions/workflows/{workflow}/runs?status=success&per_page=1
-//   2. GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts
-//   3. GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip  -> 302, ~1min-lived URL
+// Pulls the latest combined.json out of the pipeline's GitHub Actions artifact:
+//   1. GET /repos/{owner}/{repo}/actions/workflows/{workflow}/runs?status=completed&per_page=10
+//   2. For each run (newest first): GET .../runs/{run_id}/artifacts, looking for artifactName
+//   3. First one that has it: GET .../artifacts/{artifact_id}/zip -> 302, ~1min-lived URL
+//
+// Deliberately queries status=completed (any conclusion), NOT status=success, and then checks
+// each candidate run's artifact list directly - a run's overall conclusion is "failure" if ANY
+// job failed, even when `combine` (the only job that actually produces artifactName) succeeded.
+// The proactive-vuln-scan pipeline's combine job is intentionally allowed to run and upload even
+// when distribution-scan/etc. fail (see that workflow's `if: always()` on the combine job), so
+// filtering on the run's overall status would skip runs that have perfectly good data. What
+// actually matters is "does this run have the artifact", checked directly per run below - not
+// whether the whole workflow succeeded. Verified against a real run (Thevakumar-Luheerathan/
+// integration-security-tools run 31168496007): distribution-scan failed, combine succeeded and
+// uploaded combined-results, but the run's own overall conclusion was still "failure" - the
+// original status=success query found zero runs and the dashboard showed "no successful
+// pipeline runs found yet" indefinitely despite real, usable data existing.
 //
 // Stateless by design (per the approved plan): this service holds no database. All real state
 // lives in GitHub Issues (written by issue_sync.py) and in the source-of-truth artifact itself.
@@ -61,33 +73,14 @@ isolated function setCached(CachedSnapshot snapshot) {
     }
 }
 
-public function refreshSnapshot() returns CachedSnapshot|error {
-    json runsResp = check ghApi->/repos/[pipelineOwner]/[pipelineRepo]/actions/workflows/[workflowFile]/runs
-        (status = "success", per_page = 1);
-    json[] runs = check (check runsResp.workflow_runs).ensureType();
-    if runs.length() == 0 {
-        return error("no successful pipeline runs found yet");
-    }
-    int runId = check (check runs[0].id).ensureType();
-    string runHtmlUrl = check (check runs[0].html_url).ensureType();
-
-    json artifactsResp = check ghApi->/repos/[pipelineOwner]/[pipelineRepo]/actions/runs/[runId]/artifacts;
-    json[] artifacts = check (check artifactsResp.artifacts).ensureType();
-    json? target = ();
-    foreach json a in artifacts {
-        string name = check (check a.name).ensureType();
-        if name == artifactName {
-            target = a;
-            break;
-        }
-    }
-    if target is () {
-        return error(string `run ${runId} has no "${artifactName}" artifact (yet?)`);
-    }
+// Downloads and parses one run's artifactName artifact into a CachedSnapshot. Split out of
+// refreshSnapshot so a malformed/partial artifact on the newest candidate run doesn't stop the
+// caller from falling back to the next older run.
+function downloadAndParseArtifact(json target, string runHtmlUrl) returns CachedSnapshot|error {
     int artifactId = check (check target.id).ensureType();
 
-    // Step 3: the zip download. Not caching or reusing this URL - it's documented to expire
-    // ~1 minute after issuance, so we follow the redirect and read the body immediately.
+    // The zip download. Not caching or reusing this URL - it's documented to expire ~1 minute
+    // after issuance, so we follow the redirect and read the body immediately.
     http:Response|http:ClientError zipResp = redirectFollower->/repos/[pipelineOwner]/[pipelineRepo]/actions/artifacts/[artifactId]/zip(
         headers = {"Authorization": "Bearer " + ghToken}
     );
@@ -135,6 +128,47 @@ public function refreshSnapshot() returns CachedSnapshot|error {
         fetchedAt: time:utcToString(time:utcNow()),
         runUrl: runHtmlUrl
     };
+}
+
+public function refreshSnapshot() returns CachedSnapshot|error {
+    json runsResp = check ghApi->/repos/[pipelineOwner]/[pipelineRepo]/actions/workflows/[workflowFile]/runs
+        (status = "completed", per_page = 10);
+    json[] runs = check (check runsResp.workflow_runs).ensureType();
+    if runs.length() == 0 {
+        return error("no completed pipeline runs found yet");
+    }
+
+    // Runs are returned newest-first. The first one whose artifact list actually contains
+    // artifactName wins - regardless of that run's own overall conclusion (see the module
+    // docstring for why checking the run-level status isn't the right signal here).
+    foreach json run in runs {
+        int runId = check (check run.id).ensureType();
+        string runHtmlUrl = check (check run.html_url).ensureType();
+
+        json artifactsResp = check ghApi->/repos/[pipelineOwner]/[pipelineRepo]/actions/runs/[runId]/artifacts;
+        json[] artifacts = check (check artifactsResp.artifacts).ensureType();
+        json? target = ();
+        foreach json a in artifacts {
+            string name = check (check a.name).ensureType();
+            if name == artifactName {
+                target = a;
+                break;
+            }
+        }
+        if target is () {
+            continue;
+        }
+
+        CachedSnapshot|error snapshot = downloadAndParseArtifact(<json>target, runHtmlUrl);
+        if snapshot is CachedSnapshot {
+            return snapshot;
+        }
+        // This run's artifact exists but failed to download/parse - fall back to an older run
+        // rather than surfacing a hard error when a good candidate might exist right below it.
+        log:printWarn(string `run ${runId}'s "${artifactName}" artifact failed to parse, trying an older run`, 'error = snapshot);
+    }
+
+    return error(string `none of the last ${runs.length()} completed runs have a usable "${artifactName}" artifact`);
 }
 
 // Called on service startup and then on a timer (see main.bal). Never lets a failed refresh
