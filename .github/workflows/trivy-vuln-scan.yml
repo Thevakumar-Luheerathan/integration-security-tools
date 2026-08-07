@@ -365,6 +365,15 @@ jobs:
   combine:
     name: Combine results + sync issues
     needs: [generate-matrix, distribution-scan, central-scan, vscode-fs-scan, vscode-ls-scan]
+    # TEMPORARY (per user request, to test the rest of the pipeline while
+    # distribution-scan is blocked on an upstream maven.wso2.org outage): run this job even
+    # if an upstream scan job failed, instead of skipping combine entirely. combine.py already
+    # tolerates a missing report per line (records scan_status ok=false, "no report produced" -
+    # see its main()), so a partial combined.json is still produced. Revert `if: always()` back
+    # to the default (job only runs if all `needs` succeeded) once distribution-scan is healthy
+    # again - otherwise a real, non-transient distribution-scan failure would silently stop
+    # blocking the rest of the pipeline too.
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo (for pipeline scripts)
@@ -375,22 +384,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      # continue-on-error: true (temporary, same reason as above) - if the corresponding scan
+      # job failed before its upload-artifact step ran, no artifact exists at all, and this
+      # pattern match would otherwise hard-fail the step instead of just finding nothing.
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: "distribution-*"
           path: artifacts/distribution
 
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: "central-*"
           path: artifacts/central
 
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: "vscode-fs-*"
           path: artifacts/vscode-fs
 
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: "vscode-ls-*"
           path: artifacts/vscode-ls
