@@ -1,0 +1,19 @@
+{
+  "$comment": "Ballerina release lines covered by the proactive vulnerability scan pipeline. To add a new version line, add one entry here — no workflow file changes needed. 'active: false' keeps a line's history/config around without scanning it.",
+  "lines": [
+    {
+      "line": "2201.13.x",
+      "active": true,
+      "lang_branch": "2201.13.x",
+      "distribution_tag": "v2201.13.5",
+      "jdk_version": "21.0.3"
+    },
+    {
+      "line": "2201.12.x",
+      "active": true,
+      "lang_branch": "2201.12.x",
+      "distribution_tag": "v2201.12.12",
+      "jdk_version": "21.0.3"
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+/*
+  Design tokens. Two named surfaces (paper/surface), one ink, one hairline, one brand accent,
+  plus a four-color severity scale that mirrors the CVSS taxonomy this tool is built around -
+  severity is the real instrument of this domain, so it carries the accent duty rather than an
+  arbitrary single "brand color". Dark is the default (this is a triage tool people run
+  alongside a terminal), light is a full first-class alternative, not an afterthought.
+*/
+:root {
+  --paper: #f7f8fa;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --ink: #161b22;
+  --ink-muted: #59606b;
+  --line: #e1e4e9;
+  --line-strong: #c8ccd2;
+  --brand: #3457d5;
+  --brand-ink: #ffffff;
+
+  --critical: #c62853;
+  --high: #c2670b;
+  --medium: #92720b;
+  --low: #0b6fa8;
+  --unknown: #6b7280;
+
+  --critical-bg: #fce8ee;
+  --high-bg: #fdf0e2;
+  --medium-bg: #fbf3d9;
+  --low-bg: #e4f2fa;
+  --unknown-bg: #eceef1;
+
+  --shadow: 0 1px 2px rgba(20, 24, 32, 0.06), 0 1px 1px rgba(20, 24, 32, 0.04);
+  --radius: 7px;
+
+  --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Consolas, monospace;
+
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --paper: #10141a;
+  --surface: #171c24;
+  --surface-raised: #1d232c;
+  --ink: #e8ecf1;
+  --ink-muted: #8891a0;
+  --line: #262d38;
+  --line-strong: #333c4a;
+  --brand: #7c93f0;
+  --brand-ink: #10141a;
+
+  --critical: #f0567f;
+  --high: #f2a154;
+  --medium: #eecb5f;
+  --low: #5fc3ef;
+  --unknown: #8891a0;
+
+  --critical-bg: #2c1620;
+  --high-bg: #2b2013;
+  --medium-bg: #2a2412;
+  --low-bg: #142530;
+  --unknown-bg: #1e222a;
+
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.3);
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #10141a;
+    --surface: #171c24;
+    --surface-raised: #1d232c;
+    --ink: #e8ecf1;
+    --ink-muted: #8891a0;
+    --line: #262d38;
+    --line-strong: #333c4a;
+    --brand: #7c93f0;
+    --brand-ink: #10141a;
+
+    --critical: #f0567f;
+    --high: #f2a154;
+    --medium: #eecb5f;
+    --low: #5fc3ef;
+    --unknown: #8891a0;
+
+    --critical-bg: #2c1620;
+    --high-bg: #2b2013;
+    --medium-bg: #2a2412;
+    --low-bg: #142530;
+    --unknown-bg: #1e222a;
+
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.3);
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-display);
+  background: var(--paper);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

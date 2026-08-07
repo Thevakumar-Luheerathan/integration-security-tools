@@ -1,0 +1,9 @@
+{
+  "$comment": "ballerina-vscode branches covered by the proactive vulnerability scan pipeline. To add or change a branch, edit this file - no workflow changes needed. Mirrors versions.json's pattern for Ballerina release lines, but this repo has no release-line concept: it's scanned by branch (mostly 'main').",
+  "targets": [
+    {
+      "branch": "main",
+      "active": true
+    }
+  ]
+}
