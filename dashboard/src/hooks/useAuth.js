@@ -10,7 +10,7 @@ export default function useAuth() {
   const [state, setState] = useState({loading: true, authenticated: false, user: null});
 
   useEffect(() => {
-    if (window.config?.authEnabled === false) {
+    if (window.configs?.authEnabled === false) {
       setState({loading: false, authenticated: true, user: null});
       return;
     }

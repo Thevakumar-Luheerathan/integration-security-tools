@@ -29,20 +29,29 @@ dev-server-only, not present in the production build). Choreo's React buildpack 
 | Build output directory | `dist` |
 | Node Version | `20` |
 
-- Add a **File Mount** on the component (Deploy page, per environment), at the path where the
-  built `index.html` expects to find it - i.e. alongside `index.html` in the build output
-  (`dist/config.js`). Content:
+- Add a **Connection** from this component to `dashboard-backend` (Deploy page ->
+  Dependencies/Connections -> Create Connection -> select the `dashboard-backend` service).
+  Choreo generates and injects a `config.js` for you, containing a relative path proxied through
+  to the backend:
   ```js
-  window.config = {
-    apiUrl: "https://<the deployed dashboard-backend service URL>",
+  window.configs = {
+    apiUrl: "/choreo-apis/default/dashboard-backend/v1",
   };
   ```
-  This isn't a build-time env var - Choreo doesn't support baking in env vars for SPAs, since the
-  same built artifact is meant to be promoted dev -> staging -> prod. `public/config.js` (copied
-  verbatim into the build output by Vite) ships a localhost placeholder; the File Mount overwrites
-  it per environment at deploy time, without a rebuild. See `public/config.js` and `index.html`
-  for how it's wired in, and note it's visible to anyone opening browser devtools - fine for a
-  base URL, not for secrets.
+  **The global is `window.configs` (plural)** - that's Choreo's own naming for this feature, not
+  ours; `src/api.js` and `src/hooks/useAuth.js` read that exact name. This relative-path form is
+  what actually makes a `Project`-visibility backend (see below) reachable from the browser at
+  all - the browser calls this app's own origin, and Choreo's edge proxies it through internally;
+  a `dashboard-backend` with `Project` visibility has no publicly-resolvable URL of its own to put
+  in a plain File Mount instead.
+  - If you set this up manually as a File Mount rather than via Connections, the content must
+    still assign to `window.configs`, at the path where the built `index.html` expects to find it
+    (alongside `index.html` in the build output - `dist/config.js`). This isn't a build-time env
+    var either way - Choreo doesn't support baking in env vars for SPAs, since the same built
+    artifact is meant to be promoted dev -> staging -> prod. `public/config.js` (copied verbatim
+    into the build output by Vite) ships a localhost placeholder that gets overwritten at deploy
+    time, without a rebuild - see `public/config.js` and `index.html` for how it's wired in, and
+    note its content is visible to anyone opening browser devtools - fine for a URL, not secrets.
 - On the `dashboard-backend` Service component, set its `allowOrigins` configurable (in
   `Config.toml` or Choreo's environment variable equivalent) to this web app's actual deployed
   origin once known, narrowing it from the permissive `["*"]` default. Set its endpoint
@@ -84,4 +93,5 @@ npm run build                # production build -> dist/
 
 `/auth/*` doesn't exist under `vite dev` (it's a layer Choreo injects only once deployed) -
 `public/config.js`'s `authEnabled: false` bypasses the login check locally. Never set that to
-`false` in a deployed environment's File Mount.
+`false` in a deployed environment - a Connection-generated `config.js` won't include the key at
+all (which already means "enforced"), so this only matters if you're hand-writing a File Mount.

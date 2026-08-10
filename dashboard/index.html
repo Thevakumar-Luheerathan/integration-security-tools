@@ -8,8 +8,9 @@
   </head>
   <body>
     <div id="root"></div>
-    <!-- Must load before the app bundle - populates window.config, which src/api.js reads.
-         See public/config.js for why this isn't a Vite build-time env var. -->
+    <!-- Must load before the app bundle - populates window.configs (plural - Choreo's own
+         Connections-feature naming), which src/api.js reads. See public/config.js for why this
+         isn't a Vite build-time env var. -->
     <script src="/config.js"></script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
