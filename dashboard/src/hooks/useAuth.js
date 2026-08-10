@@ -34,6 +34,11 @@ export default function useAuth() {
   return state;
 }
 
+function readCookie(name) {
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 // Full-page redirects to Choreo's injected endpoints - not API calls. Login/logout are
 // necessarily whole-page flows (they hand off to the IdP and back), not something to fetch().
 export function login() {
@@ -41,5 +46,12 @@ export function login() {
 }
 
 export function logout() {
-  window.location.href = "/auth/logout";
+  // Choreo's docs are explicit that /auth/logout must be called WITH the session_hint cookie's
+  // value as a query param - without it, the IdP's end-session request Choreo forwards is
+  // incomplete and gets rejected (observed for real: Asgardeo returned "Sign Out Failure -
+  // unauthorized_request - access denied due to invalid request details" when this was missing).
+  const sessionHint = readCookie("session_hint");
+  window.location.href = sessionHint
+    ? `/auth/logout?session_hint=${encodeURIComponent(sessionHint)}`
+    : "/auth/logout";
 }
