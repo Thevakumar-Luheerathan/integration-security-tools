@@ -45,7 +45,33 @@ dev-server-only, not present in the production build). Choreo's React buildpack 
   base URL, not for secrets.
 - On the `dashboard-backend` Service component, set its `allowOrigins` configurable (in
   `Config.toml` or Choreo's environment variable equivalent) to this web app's actual deployed
-  origin once known, narrowing it from the permissive `["*"]` default.
+  origin once known, narrowing it from the permissive `["*"]` default. Set its endpoint
+  **visibility to `Project`** (not `Organization`/`Public`) - this is what actually keeps it
+  unreachable from the public internet; login below only gates this web app, not the API's
+  network reachability.
+
+### Restricting access to your team (Managed Authentication + Asgardeo)
+
+This dashboard is meant to be login-gated, not public. One-time setup, outside this repo:
+
+1. **Asgardeo** (asgardeo.io console): register a Standard-Based OIDC application, set its
+   authorized redirect URLs to `https://<this-app's-deployed-url>/auth/login/callback` and
+   `.../auth/logout/callback`, grant types `Code` + `Refresh Token`, access token type `JWT`.
+   Create a group for your team (e.g. `security-dashboard-users`), add members, and apply the
+   **Group-Based Access Control** conditional-auth template so login only *completes* for group
+   members - not just anyone with an Asgardeo account.
+2. **Choreo org settings** (one-time, applies to every project in the org): Settings ->
+   Organization -> Application Security -> Identity Providers -> + Identity Provider -> Asgardeo
+   -> paste the application's well-known/discovery URL from step 1.
+3. **This component's Deploy page**: enable "Managed Authentication with Choreo", select the
+   Asgardeo identity provider, set Post Login/Logout/Error paths and session expiry.
+
+Once enabled, Choreo injects `/auth/login`, `/auth/logout`, and `/auth/userinfo` into the deployed
+app - `src/hooks/useAuth.js` is what calls `/auth/userinfo` to decide whether to render the
+dashboard or a sign-in prompt. No token handling happens in this app's own code: Choreo's
+managed-auth layer keeps tokens out of browser JS entirely (HTTP-only session cookies), and the
+existing Connection to `dashboard-backend` gets the cookie swapped for a real token server-side -
+nothing in `src/api.js` needs to change for this.
 
 ## Local development
 
@@ -55,3 +81,7 @@ npm install
 npm run dev                  # dev server with hot reload
 npm run build                # production build -> dist/
 ```
+
+`/auth/*` doesn't exist under `vite dev` (it's a layer Choreo injects only once deployed) -
+`public/config.js`'s `authEnabled: false` bypasses the login check locally. Never set that to
+`false` in a deployed environment's File Mount.

@@ -3,6 +3,13 @@ import "./App.css";
 import {fetchSummary, triggerRefresh} from "./api";
 import PackageTable from "./components/PackageTable";
 import ThemeToggle from "./components/ThemeToggle";
+import useAuth, {login, logout} from "./hooks/useAuth";
+
+// The exact shape of Choreo's /auth/userinfo claims isn't documented beyond "user claims" - try
+// the common OIDC/Asgardeo field names and fall back to nothing rather than assume one.
+function displayName(user) {
+  return user?.username || user?.email || user?.given_name || user?.name || null;
+}
 
 function formatTimestamp(iso) {
   if (!iso) return "unknown";
@@ -17,6 +24,7 @@ function formatTimestamp(iso) {
 }
 
 function App() {
+  const auth = useAuth();
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -36,8 +44,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    // No point calling dashboard-backend before we know the visitor is actually logged in -
+    // avoids a flash of "loading scan data" behind the sign-in screen.
+    if (auth.authenticated) {
+      load();
+    }
+  }, [auth.authenticated, load]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -63,20 +75,43 @@ function App() {
         </div>
         <div className="topbar-actions">
           <ThemeToggle />
-          <button className="btn-refresh" onClick={handleRefresh} disabled={refreshing || loading}>
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </button>
+          {auth.authenticated && (
+            <>
+              {displayName(auth.user) && <span className="user-badge">{displayName(auth.user)}</span>}
+              <button className="btn-refresh" onClick={handleRefresh} disabled={refreshing || loading}>
+                {refreshing ? "Refreshing…" : "Refresh"}
+              </button>
+              {/* No real session to sign out of in local dev (auth.user is null there - see
+                  useAuth's authEnabled bypass), so only show this once there's an actual one. */}
+              {auth.user && <button className="btn-signout" onClick={logout}>Sign out</button>}
+            </>
+          )}
         </div>
       </header>
 
-      {loading && (
+      {auth.loading && (
+        <div className="state-panel">
+          <div className="spinner" aria-hidden="true" />
+          <p>Checking your session…</p>
+        </div>
+      )}
+
+      {!auth.loading && !auth.authenticated && (
+        <div className="state-panel state-login">
+          <p className="state-title">Sign in required</p>
+          <p>This dashboard is restricted to the security team.</p>
+          <button className="btn-refresh" onClick={login}>Sign in</button>
+        </div>
+      )}
+
+      {!auth.loading && auth.authenticated && loading && (
         <div className="state-panel">
           <div className="spinner" aria-hidden="true" />
           <p>Loading the latest scan…</p>
         </div>
       )}
 
-      {!loading && error && (
+      {!auth.loading && auth.authenticated && !loading && error && (
         <div className="state-panel state-error">
           <p className="state-title">Couldn't load scan data</p>
           <p>{error}</p>
@@ -84,7 +119,7 @@ function App() {
         </div>
       )}
 
-      {!loading && !error && data && (
+      {!auth.loading && auth.authenticated && !loading && !error && data && (
         <>
           <p className="meta-line">
             Generated {formatTimestamp(data.generatedAt)} &middot; fetched {formatTimestamp(data.fetchedAt)} &middot;{" "}
