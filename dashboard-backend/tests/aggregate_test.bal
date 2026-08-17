@@ -5,10 +5,11 @@
 // and pointing the Choreo service at a fixture." Presentation-layer tests (HTML rendering) were
 // removed when the dashboard UI moved to the separate React app - see ../../dashboard/.
 
+import integration_security_tools/dashboard_backend.model;
 import ballerina/io;
 import ballerina/test;
 
-function loadFixture() returns CombinedReport|error {
+function loadFixture() returns model:CombinedReport|error {
     json j = check io:fileReadJson("tests/combined.sample.json");
     return j.cloneWithType();
 }
@@ -24,7 +25,7 @@ function findPackage(PackageSummary[] packages, string? packageOrg, string packa
 
 @test:Config {}
 function testSummarizeByVersionAndSourceCoversEveryScanStatus() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     VersionSourceSummary[] summaries = summarizeByVersionAndSource(report);
 
     // The fixture's scan_status lists 4 (version, source) pairs, including one with ok=false
@@ -52,7 +53,7 @@ function testSummarizeByVersionAndSourceCoversEveryScanStatus() returns error? {
 
 @test:Config {}
 function testSeverityCountsMatchFixture() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     VersionSourceSummary[] summaries = summarizeByVersionAndSource(report);
 
     // 2201.12.x/central in the fixture: netty-codec (HIGH) + netty-codec-http (HIGH) +
@@ -67,7 +68,7 @@ function testSeverityCountsMatchFixture() returns error? {
 
 @test:Config {}
 function testSummarizeByPackageGroupsOnePackageAcrossVersionLines() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     PackageSummary[] packages = summarizeByPackage(report);
 
     // ballerina/http has findings on BOTH 2201.12.x (package_version 2.13.0) and 2201.13.x
@@ -101,7 +102,7 @@ function testSummarizeByPackageGroupsOnePackageAcrossVersionLines() returns erro
 
 @test:Config {}
 function testSummarizeByPackageGroupsBallerinaLangByLineNotByJar() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     PackageSummary[] packages = summarizeByPackage(report);
 
     // ballerina-lang (package_org == ()) has findings on both 2201.12.x (commons-beanutils) and
@@ -120,7 +121,10 @@ function testSummarizeByPackageGroupsBallerinaLangByLineNotByJar() returns error
             test:assertEquals(v.findings[0].cve, "CVE-2025-48734",
                     msg = "commons-beanutils must be scoped to its own 2201.12.x version group, not mixed with 2201.13.x findings");
         } else if v.label == "2201.13.x" {
-            test:assertEquals(v.findings.length(), 2, msg = "netty-codec-http and jackson-databind both belong to 2201.13.x");
+            // netty-codec-http, jackson-databind CVE-2026-54512, and the accepted-risk
+            // CVE-2025-48924 - accepted_risk findings are never dropped, just tagged (see
+            // testAcceptedRiskFindingsAreNeverDroppedFromTheTree below), so they still count here.
+            test:assertEquals(v.findings.length(), 3, msg = "netty-codec-http, jackson-databind, and the accepted-risk finding all belong to 2201.13.x");
         } else {
             test:assertFail(string `unexpected version group label ${v.label}`);
         }
@@ -129,7 +133,7 @@ function testSummarizeByPackageGroupsBallerinaLangByLineNotByJar() returns error
 
 @test:Config {}
 function testSummarizeByPackageNeverProducesAnUnresolvedBucket() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     PackageSummary[] packages = summarizeByPackage(report);
 
     // There is no repo-resolution step left to fail (confirmed design decision) - every finding
@@ -141,16 +145,16 @@ function testSummarizeByPackageNeverProducesAnUnresolvedBucket() returns error? 
         test:assertFalse(p.package_name == "(unresolved)");
     }
 
-    // The package with no synced issue yet (rocketmq driver) still surfaces with issue = () -
-    // "no issue yet" is a legitimate, visible state, not a silent drop.
+    // The package with no synced issue yet (rocketmq driver) still surfaces with an all-zero
+    // rollup and no open issue - "no issue yet" is a legitimate, visible state, not a silent drop.
     PackageSummary? rocketmq = findPackage(packages, "ballerinax", "cdc.schema.rocketmq.driver");
     test:assertTrue(rocketmq is PackageSummary);
-    test:assertTrue((<PackageSummary>rocketmq).issue is (), msg = "rocketmq driver has no issue synced yet in the fixture - should show as absent, not crash");
+    test:assertTrue((<PackageSummary>rocketmq).issueSummary.openIssue is (), msg = "rocketmq driver has no issue synced yet in the fixture - should show as absent, not crash");
 }
 
 @test:Config {}
 function testSummarizeByPackageExcludesVscodeExtension() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     PackageSummary[] packages = summarizeByPackage(report);
 
     // The fixture's 2 vscode-extension findings must never appear in the Packages view - they
@@ -163,7 +167,7 @@ function testSummarizeByPackageExcludesVscodeExtension() returns error? {
 
 @test:Config {}
 function testSummarizeByPluginGroupsByBranchNotVersion() returns error? {
-    CombinedReport report = check loadFixture();
+    model:CombinedReport report = check loadFixture();
     PackageSummary[] plugins = summarizeByPlugin(report);
 
     // Exactly one plugin (ballerina-vscode), never mixed into the Packages count.
@@ -186,6 +190,53 @@ function testSummarizeByPluginGroupsByBranchNotVersion() returns error? {
     test:assertEquals(vscode.counts.critical, 1);
 
     // The issue synced for this package is visible exactly like a real package's.
-    test:assertTrue(vscode.issue is IssueRef, msg = "expected the fixture's synced issue to surface");
+    test:assertTrue(vscode.issueSummary.openIssue is model:IssueRef, msg = "expected the fixture's synced issue to surface");
+}
+
+@test:Config {}
+function testAcceptedRiskFindingsAreNeverDroppedFromTheTree() returns error? {
+    model:CombinedReport report = check loadFixture();
+    PackageSummary[] packages = summarizeByPackage(report);
+
+    // ballerina-lang's fixture accepted-risk finding (CVE-2025-48924, .trivyignore@2201.13.x)
+    // must still be present in its VersionGroup, carrying its accepted_risk reason verbatim -
+    // never dropped just because it's not an active/tracked finding.
+    PackageSummary? lang = findPackage(packages, (), "ballerina-lang");
+    test:assertTrue(lang is PackageSummary);
+    PackageSummary langPkg = <PackageSummary>lang;
+
+    model:Finding? acceptedFinding = ();
+    foreach var v in langPkg.versions {
+        foreach var f in v.findings {
+            if f.cve == "CVE-2025-48924" {
+                acceptedFinding = f;
+            }
+        }
+    }
+    test:assertTrue(acceptedFinding is model:Finding, msg = "accepted-risk finding must still appear in the version tree");
+    model:AcceptedRisk? risk = (<model:Finding>acceptedFinding).accepted_risk;
+    test:assertTrue(risk is model:AcceptedRisk);
+    test:assertEquals((<model:AcceptedRisk>risk).reason, "Need to be fixed");
+    test:assertTrue((<model:Finding>acceptedFinding).issue is (), msg = "accepted-risk findings are never issue-tracked - issue_sync.py skips them entirely");
+
+    // Package-level rollup: this package has 3 open findings (CVE-2026-42587, CVE-2026-54512
+    // on 2201.13.x, and CVE-2025-48734 on 2201.12.x - all issue #2) plus this 1 accepted-risk one.
+    test:assertEquals(langPkg.issueSummary.acceptedRiskCount, 1);
+    test:assertEquals(langPkg.issueSummary.openCount, 3);
+}
+
+@test:Config {}
+function testSummarizeAcceptedRiskByLine() returns error? {
+    model:CombinedReport report = check loadFixture();
+    AcceptedRiskLineSummary[] byLine = summarizeAcceptedRiskByLine(report);
+
+    // Fixture has exactly one accepted-risk finding per line (2201.13.x: ballerina-lang's
+    // jackson-databind; 2201.12.x: ballerinax/redis's commons-compress) - two distinct lines,
+    // one each, sorted ascending.
+    test:assertEquals(byLine.length(), 2);
+    test:assertEquals(byLine[0].ballerina_version, "2201.12.x");
+    test:assertEquals(byLine[0].count, 1);
+    test:assertEquals(byLine[1].ballerina_version, "2201.13.x");
+    test:assertEquals(byLine[1].count, 1);
 }
 

@@ -32,7 +32,7 @@ function matches(term, ...values) {
 }
 
 function findingMatches(term, finding) {
-  return matches(term, finding.cve, finding.jar, finding.library_name, finding.severity);
+  return matches(term, finding.cve, finding.jar, finding.library_name, finding.severity, finding.accepted_risk?.reason);
 }
 
 function versionMatches(term, version) {
@@ -43,9 +43,54 @@ function packageMatches(term, pkg) {
   return matches(term, packageDisplayName(pkg)) || pkg.versions.some((v) => versionMatches(term, v));
 }
 
+// Three states a finding can be in - never four, never fewer. A finding is NEVER dropped from
+// the tree for being anything other than "active" (see combine.py/issue_sync.py) - it just gets
+// a different badge and muted row styling here, so the active count still draws the eye first.
+function findingState(finding) {
+  if (finding.accepted_risk) return "accepted";
+  if (finding.issue?.state === "closed") return "closed";
+  return "active";
+}
+
+// Shows the actual .trivyignore reason text verbatim for accepted-risk findings (not a generic
+// "ignored" label - the whole point is surfacing WHY), or a closed-issue link for the
+// closed-but-still-detected case. Nothing rendered for active findings - the severity badge
+// already carries the weight there.
+function FindingStateBadge({finding}) {
+  const state = findingState(finding);
+  if (state === "accepted") {
+    return (
+      <span className="finding-state finding-state-accepted" title={finding.accepted_risk.reason}>
+        Accepted risk
+      </span>
+    );
+  }
+  if (state === "closed") {
+    const issue = finding.issue;
+    return issue?.url ? (
+      <a
+        href={issue.url}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        className="finding-state finding-state-closed"
+      >
+        Closed &middot; #{issue.number}
+      </a>
+    ) : (
+      <span className="finding-state finding-state-closed">Closed</span>
+    );
+  }
+  return null;
+}
+
 function CveRow({finding, ancestorsLast, isLast}) {
+  const state = findingState(finding);
   return (
-    <div className="tree-row cve-row" style={{"--spine": `var(--${finding.severity?.toLowerCase() || "unknown"})`}}>
+    <div
+      className={`tree-row cve-row cve-row-${state}`}
+      style={{"--spine": `var(--${finding.severity?.toLowerCase() || "unknown"})`}}
+    >
       <div className="tree-cell tree-cell-name">
         <Guides ancestorsLast={ancestorsLast} isLast={isLast} />
         <span className="cve-jar">
@@ -64,7 +109,9 @@ function CveRow({finding, ancestorsLast, isLast}) {
           <span className="cve-fixed">{finding.fixed_version || "no fix yet"}</span>
         </span>
       </div>
-      <div className="tree-cell tree-cell-issue" />
+      <div className="tree-cell tree-cell-issue">
+        <FindingStateBadge finding={finding} />
+      </div>
     </div>
   );
 }
@@ -111,6 +158,41 @@ function VersionNode({version, ancestorsLast, isLast, forceExpanded, term}) {
   );
 }
 
+// A package can legitimately span more than one issue over its life (a closed issue's CVEs
+// never reopen, but a genuinely new CVE gets a fresh one - see issue_sync.py) - so this is a
+// rollup of counts, not one ambiguous link. The open count links straight to the open issue,
+// since there's realistically at most one at a time.
+function PackageIssueRollup({summary}) {
+  const openCount = summary?.openCount ?? 0;
+  const closedCount = summary?.closedCount ?? 0;
+  const acceptedRiskCount = summary?.acceptedRiskCount ?? 0;
+  const openIssue = summary?.openIssue;
+
+  if (openCount === 0 && closedCount === 0 && acceptedRiskCount === 0) {
+    return <span className="issue-pill issue-none">no issue yet</span>;
+  }
+
+  return (
+    <span className="issue-rollup">
+      {openCount > 0 && (openIssue?.url ? (
+        <a
+          href={openIssue.url}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="issue-pill issue-open"
+        >
+          {openCount} open
+        </a>
+      ) : (
+        <span className="issue-pill issue-open">{openCount} open</span>
+      ))}
+      {closedCount > 0 && <span className="issue-pill issue-closed">{closedCount} closed</span>}
+      {acceptedRiskCount > 0 && <span className="issue-pill issue-accepted">{acceptedRiskCount} accepted</span>}
+    </span>
+  );
+}
+
 function PackageNode({pkg, isLast, forceExpanded, term}) {
   const [expanded, setExpanded] = useState(false);
   const isExpanded = forceExpanded || expanded;
@@ -132,13 +214,7 @@ function PackageNode({pkg, isLast, forceExpanded, term}) {
           <SeverityBar counts={pkg.counts} />
         </div>
         <div className="tree-cell tree-cell-issue">
-          {pkg.issue && pkg.issue.url ? (
-            <a href={pkg.issue.url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className={`issue-pill issue-${pkg.issue.state}`}>
-              #{pkg.issue.number} &middot; {pkg.issue.state}
-            </a>
-          ) : (
-            <span className="issue-pill issue-none">no issue yet</span>
-          )}
+          <PackageIssueRollup summary={pkg.issueSummary} />
         </div>
       </div>
       {isExpanded &&

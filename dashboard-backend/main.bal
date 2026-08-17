@@ -1,3 +1,4 @@
+import integration_security_tools/dashboard_backend.alerting;
 import ballerina/http;
 import ballerina/log;
 import ballerina/task;
@@ -15,7 +16,21 @@ isolated class RefreshJob {
     *task:Job;
 
     public function execute() {
+        // Captured BEFORE this cycle's refresh overwrites the cache - this is the "previous
+        // snapshot" alerting.checkImmediateAlerts diffs against. () on a cold start (nothing
+        // cached yet) or the very first refresh ever - checkImmediateAlerts is skipped in that
+        // case below, since there's nothing meaningful to diff a first snapshot against.
+        CachedSnapshot? previous = getCached();
+
         refreshSnapshotSafely();
+
+        CachedSnapshot? current = getCached();
+        if previous is CachedSnapshot && current is CachedSnapshot {
+            error? alertResult = alerting:checkImmediateAlerts(previous.report, current.report);
+            if alertResult is error {
+                log:printError("immediate alert check failed", 'error = alertResult);
+            }
+        }
     }
 }
 
@@ -59,6 +74,9 @@ service / on new http:Listener(port) {
             byVersionAndSource: summarizeByVersionAndSource(snapshot.report).toJson(),
             byPackage: summarizeByPackage(snapshot.report).toJson(),
             byPlugin: summarizeByPlugin(snapshot.report).toJson(),
+            // "Accepted vulnerabilities in each Distribution" - per the reference design doc,
+            // a per-line rollup distinct from the inline per-package/per-CVE display above.
+            acceptedRiskByLine: summarizeAcceptedRiskByLine(snapshot.report).toJson(),
             findings: snapshot.report.findings.toJson()
         };
     }
@@ -72,6 +90,31 @@ service / on new http:Listener(port) {
     resource function post refresh() returns json {
         refreshSnapshotSafely();
         return {status: "refresh triggered"};
+    }
+
+    // Deliberately a SEPARATE, externally-triggered endpoint rather than something checked on
+    // every internal refresh cycle (see alerting.alert.bal's header comment) - a once-a-week
+    // external schedule (e.g. a Choreo cron trigger) should call this, not the ~30min refresh
+    // loop, which would otherwise fire it ~48 times on the digest day with no database-backed
+    // "already sent today" guard. alert.bal itself also re-checks the configured digest day as a
+    // defense-in-depth guard against a misconfigured trigger.
+    resource function post alerts/weekly\-digest() returns json|http:Response {
+        CachedSnapshot|error snapshot = getSnapshotOrRefresh();
+        if snapshot is error {
+            http:Response response = new;
+            response.statusCode = 503;
+            response.setJsonPayload({'error: snapshot.message()});
+            return response;
+        }
+
+        error? result = alerting:sendWeeklyDigest(snapshot.report);
+        if result is error {
+            http:Response response = new;
+            response.statusCode = 502;
+            response.setJsonPayload({'error: result.message()});
+            return response;
+        }
+        return {status: "weekly digest sent"};
     }
 }
 

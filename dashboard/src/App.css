@@ -183,6 +183,45 @@
   text-decoration: underline;
 }
 
+/* ---------- Accepted-risk rollup ("Accepted vulnerabilities in each Distribution") ---------- */
+
+.accepted-risk-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.6rem 0.9rem;
+  margin-bottom: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+}
+
+.accepted-risk-summary-label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--ink-muted);
+  margin-right: 0.15rem;
+}
+
+.accepted-risk-summary-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-muted);
+}
+
+.accepted-risk-summary-count {
+  font-weight: 700;
+  color: var(--ink);
+}
+
 /* ---------- Findings tabs (Packages / Plugins) ---------- */
 
 .findings {
@@ -539,6 +578,59 @@
 .issue-pill.issue-none {
   opacity: 0.6;
   font-style: italic;
+}
+
+.issue-pill.issue-accepted {
+  border-color: var(--line-strong);
+  color: var(--ink-muted);
+}
+
+.issue-rollup {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* ---------- Finding state (per-CVE-row: active / closed-pending / accepted-risk) ---------- */
+
+/* Active findings get no badge at all - the severity badge already carries the weight, and an
+   empty cell keeps the eye drawn to what still needs attention. */
+.finding-state {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-muted);
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.finding-state-closed {
+  text-decoration: line-through;
+}
+
+a.finding-state-closed:hover {
+  text-decoration: line-through;
+}
+
+.finding-state-accepted {
+  cursor: help;
+  border-style: dashed;
+}
+
+/* Muted row treatment for the two non-active states - still fully visible (never hidden), just
+   visually receding so genuinely active findings read first. */
+.cve-row-closed,
+.cve-row-accepted {
+  opacity: 0.6;
+}
+
+.cve-row-closed:hover,
+.cve-row-accepted:hover {
+  opacity: 1;
 }
 
 a {

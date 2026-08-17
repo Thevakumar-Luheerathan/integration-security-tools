@@ -22,6 +22,7 @@
 // so a transient GitHub API hiccup doesn't blank the dashboard - falling back to stale-but-known
 // data (with a visible staleness banner, see render.bal) beats showing an error page.
 
+import integration_security_tools/dashboard_backend.model;
 import ballerina/http;
 import ballerina/io;
 import ballerina/log;
@@ -48,7 +49,7 @@ final http:Client redirectFollower = check new ("https://api.github.com", {
 });
 
 type CachedSnapshot record {|
-    CombinedReport report;
+    model:CombinedReport report;
     string fetchedAt;
     string runUrl;
 |};
@@ -121,7 +122,7 @@ function downloadAndParseArtifact(json target, string runHtmlUrl) returns Cached
     }
 
     json combinedJson = check io:fileReadJson(workDir + "/combined.json");
-    CombinedReport report = check combinedJson.cloneWithType();
+    model:CombinedReport report = check combinedJson.cloneWithType();
 
     return {
         report,

@@ -70,6 +70,28 @@ jobs:
           echo "vscode_branches=$VBRANCHES" >> "$GITHUB_OUTPUT"
           echo "Active ballerina-vscode branches: $VBRANCHES"
 
+      # ballerina-distribution's own per-branch .trivyignore is the org's ONE established place
+      # for accepted-risk tracking (verified real: 2201.12.x/2201.13.x have substantially
+      # different, richly-commented content) - fetched once here per line and applied to BOTH
+      # distribution-scan and central-scan findings for that line in combine.py (no per-Central-
+      # package repo lookup needed - that's exactly the fragile mechanism dropped earlier).
+      # Plain raw.githubusercontent.com fetch: public repo, no auth needed. A line with no
+      # .trivyignore at that ref just gets no file - combine.py treats that as "nothing accepted".
+      - name: Fetch ballerina-distribution's per-line .trivyignore
+        run: |
+          mkdir -p dist-trivyignore
+          for line in $(echo '${{ steps.set-matrix.outputs.lines }}' | jq -r '.[]'); do
+            curl -sfL "https://raw.githubusercontent.com/ballerina-platform/ballerina-distribution/${line}/.trivyignore" \
+              -o "dist-trivyignore/${line}.trivyignore" \
+              || { echo "no .trivyignore on ballerina-distribution@${line} - proceeding with none" >&2; rm -f "dist-trivyignore/${line}.trivyignore"; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-trivyignore
+          path: dist-trivyignore/
+          retention-days: 14
+          if-no-files-found: warn
+
   warm-trivy-db:
     name: Pre-download Trivy vulnerability DBs
     needs: generate-matrix
@@ -268,9 +290,10 @@ jobs:
         run: |
           trivy image --download-db-only --cache-dir /tmp/trivy-cache
 
-      - name: Scan (same scan-ref/skip-dirs/ignore-unfixed/trivyignores as upstream's fs step -
-          minus exit-code/table-format, since this pipeline reports findings rather than
-          failing a build on them)
+      - name: Scan (same scan-ref/skip-dirs/ignore-unfixed as upstream's fs step - minus
+          exit-code/table-format/trivyignores, since suppression now happens in combine.py for
+          one unified code path across every source rather than natively in Trivy just for
+          this one - see combine.py's accepted_risk handling)
         run: |
           set -euo pipefail
           touch /tmp/vscode-trivyignore
@@ -278,6 +301,7 @@ jobs:
           if [ -f submodules/wso2-vscode-extensions/.trivyignore ]; then
             cat submodules/wso2-vscode-extensions/.trivyignore >> /tmp/vscode-trivyignore
           fi
+          cp /tmp/vscode-trivyignore "${{ github.workspace }}/vscode-fs.trivyignore"
 
           trivy fs \
             --format json \
@@ -287,14 +311,15 @@ jobs:
             --skip-db-update \
             --timeout 10m \
             --ignore-unfixed \
-            --ignorefile /tmp/vscode-trivyignore \
             --skip-dirs 'common/temp,submodules,packages/ballerina-language-server/**/src/test/resources,packages/ballerina-language-server/**/src/test/data,packages/ballerina-language-server/**/build/resources/test' \
             "${{ github.workspace }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: vscode-fs-${{ matrix.branch }}
-          path: vscode-fs-report.json
+          path: |
+            vscode-fs-report.json
+            vscode-fs.trivyignore
           retention-days: 14
 
   vscode-ls-scan:
@@ -345,21 +370,25 @@ jobs:
         run: |
           trivy image --download-db-only --cache-dir /tmp/trivy-cache
 
-      - name: Scan the SBOM (same as upstream's ls-trivy step, minus exit-code/table-format)
+      - name: Scan the SBOM (same as upstream's ls-trivy step, minus exit-code/table-format/
+          trivyignores - suppression now happens in combine.py, see the matching comment in
+          vscode-fs-scan)
         run: |
+          cp .trivyignore "${{ github.workspace }}/vscode-ls.trivyignore" || touch "${{ github.workspace }}/vscode-ls.trivyignore"
           trivy sbom \
             --format json \
             --output "${{ github.workspace }}/vscode-ls-report.json" \
             --cache-dir /tmp/trivy-cache \
             --skip-db-update \
             --timeout 10m \
-            --ignorefile .trivyignore \
             build/sbom.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: vscode-ls-${{ matrix.branch }}
-          path: vscode-ls-report.json
+          path: |
+            vscode-ls-report.json
+            vscode-ls.trivyignore
           retention-days: 14
 
   combine:
@@ -411,6 +440,12 @@ jobs:
           pattern: "vscode-ls-*"
           path: artifacts/vscode-ls
 
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: dist-trivyignore
+          path: artifacts/dist-trivyignore
+
       - name: Combine per-line reports into combined.json
         run: |
           set -euo pipefail
@@ -419,14 +454,21 @@ jobs:
 
           DIST_ARGS=()
           CENTRAL_ARGS=()
+          IGNORE_ARGS=()
           for line in $LINES; do
             DIST_REPORT="artifacts/distribution/distribution-${line}/distribution-report.json"
             CENTRAL_DIR="artifacts/central/central-${line}"
+            DIST_IGNORE="artifacts/dist-trivyignore/${line}.trivyignore"
             if [ -f "$DIST_REPORT" ]; then
               DIST_ARGS+=(--distribution-report "${line}=${DIST_REPORT}")
             fi
             if [ -d "$CENTRAL_DIR" ]; then
               CENTRAL_ARGS+=(--central-dir "${line}=${CENTRAL_DIR}")
+            fi
+            # Same file applies to BOTH distribution and central findings for this line - ONE
+            # shared accepted-risk list per the confirmed design, not per-package.
+            if [ -f "$DIST_IGNORE" ]; then
+              IGNORE_ARGS+=(--dist-trivyignore "${line}=${DIST_IGNORE}")
             fi
           done
 
@@ -434,16 +476,24 @@ jobs:
           for branch in $VSCODE_BRANCHES; do
             FS_REPORT="artifacts/vscode-fs/vscode-fs-${branch}/vscode-fs-report.json"
             LS_REPORT="artifacts/vscode-ls/vscode-ls-${branch}/vscode-ls-report.json"
+            FS_IGNORE="artifacts/vscode-fs/vscode-fs-${branch}/vscode-fs.trivyignore"
+            LS_IGNORE="artifacts/vscode-ls/vscode-ls-${branch}/vscode-ls.trivyignore"
             if [ -f "$FS_REPORT" ]; then
               VSCODE_ARGS+=(--vscode-report "${branch}=${FS_REPORT}")
             fi
             if [ -f "$LS_REPORT" ]; then
               VSCODE_ARGS+=(--vscode-report "${branch}=${LS_REPORT}")
             fi
+            if [ -f "$FS_IGNORE" ]; then
+              IGNORE_ARGS+=(--vscode-trivyignore "${branch}=${FS_IGNORE}")
+            fi
+            if [ -f "$LS_IGNORE" ]; then
+              IGNORE_ARGS+=(--vscode-trivyignore "${branch}=${LS_IGNORE}")
+            fi
           done
 
           python3 trivy-vuln-scan/scripts/combine.py \
-            "${DIST_ARGS[@]}" "${CENTRAL_ARGS[@]}" "${VSCODE_ARGS[@]}" \
+            "${DIST_ARGS[@]}" "${CENTRAL_ARGS[@]}" "${VSCODE_ARGS[@]}" "${IGNORE_ARGS[@]}" \
             --out combined.json
 
       - name: Sync findings to tracking issues

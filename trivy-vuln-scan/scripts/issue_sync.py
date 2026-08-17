@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
 LABEL = "trivy-scan"
 CVE_ID_RE = re.compile(r"(CVE-\d{4}-\d+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})", re.IGNORECASE)
@@ -84,11 +85,17 @@ def issue_title(package_org, package_name):
 
 
 def find_package_issues(tracking_repo, title):
-    """Returns (open_issue_or_None, [closed_issues]), each a dict with number/title/state/url/body."""
+    """Returns (open_issue_or_None, [closed_issues]), each a dict with number/title/state/url/body.
+
+    createdAt is requested alongside the rest so it can be threaded onto the Finding.issue ref
+    written at the bottom of this script - the alerting module (dashboard-backend) needs "how
+    long has this been open" to detect a severe issue crossing the not-attended threshold, without
+    a second GitHub API round-trip of its own.
+    """
     result = gh([
         "issue", "list", "--repo", tracking_repo, "--label", LABEL,
         "--state", "all", "--search", f'"{title}" in:title',
-        "--json", "number,title,state,url,body,updatedAt",
+        "--json", "number,title,state,url,body,updatedAt,createdAt",
     ])
     matches = [item for item in json.loads(result) if item["title"] == title]
 
@@ -186,9 +193,13 @@ def render_body(package_org, package_name, findings, suppressed_count):
 def create_issue(tracking_repo, package_org, package_name, active_findings, dry_run):
     title = issue_title(package_org, package_name)
     body = render_body(package_org, package_name, active_findings, suppressed_count=0)
+    # Approximated as "now" rather than a follow-up `gh issue view` round-trip - a few seconds of
+    # drift from the real creation timestamp is irrelevant for a "been open more than a week"
+    # staleness check.
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if dry_run:
         print(f"[dry-run] would CREATE issue '{title}' ({len(active_findings)} active finding(s))", file=sys.stderr)
-        return {"number": None, "url": None, "state": "open"}
+        return {"number": None, "url": None, "state": "open", "created_at": created_at}
     out = gh([
         "issue", "create", "--repo", tracking_repo, "--title", title,
         "--body", body, "--label", LABEL,
@@ -196,7 +207,7 @@ def create_issue(tracking_repo, package_org, package_name, active_findings, dry_
     # `gh issue create` prints the created issue's URL as its only stdout line.
     url = out.strip().splitlines()[-1]
     number = int(url.rstrip("/").rsplit("/", 1)[-1])
-    return {"number": number, "url": url, "state": "open"}
+    return {"number": number, "url": url, "state": "open", "created_at": created_at}
 
 
 def update_issue(tracking_repo, issue, package_org, package_name, active_findings, suppressed_count, dry_run):
@@ -205,7 +216,7 @@ def update_issue(tracking_repo, issue, package_org, package_name, active_finding
         print(f"[dry-run] would UPDATE issue #{issue['number']} ({len(active_findings)} active finding(s))", file=sys.stderr)
     else:
         gh(["issue", "edit", str(issue["number"]), "--repo", tracking_repo, "--body", body])
-    return {"number": issue["number"], "url": issue["url"], "state": "open"}
+    return {"number": issue["number"], "url": issue["url"], "state": "open", "created_at": issue.get("createdAt")}
 
 
 def close_issue(tracking_repo, issue, dry_run):
@@ -253,7 +264,10 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run):
 
     for f in suppressed:
         closed_issue = closed_cve_to_issue[f["cve"]]
-        issue_refs[id(f)] = {"number": closed_issue["number"], "url": closed_issue["url"], "state": "closed"}
+        issue_refs[id(f)] = {
+            "number": closed_issue["number"], "url": closed_issue["url"], "state": "closed",
+            "created_at": closed_issue.get("createdAt"),
+        }
 
     return issue_refs
 
@@ -273,21 +287,31 @@ def main():
     for finding in combined["findings"]:
         finding.setdefault("issue", None)
 
+    # Every package that had ANY finding this run still gets grouped here - including ones whose
+    # findings are entirely accepted_risk - so sync_package still gets called for it below and
+    # can auto-close a previously-open issue if nothing trackable remains. accepted_risk findings
+    # themselves are filtered out before being handed to sync_package: they're pre-accepted at
+    # scan time (via .trivyignore), so they never influence issue creation/update/closing and
+    # never get an issue reference written (stays None from the setdefault above) - tracked via
+    # their accepted_risk field instead, not a GitHub issue.
     by_package = defaultdict(list)
     for finding in combined["findings"]:
         by_package[(finding["package_org"], finding["package_name"])].append(finding)
 
-    for (package_org, package_name), findings in by_package.items():
-        issue_refs = sync_package(args.tracking_repo, package_org, package_name, findings, args.dry_run)
-        active_count = sum(1 for f in findings if issue_refs.get(id(f), {}).get("state") == "open")
-        suppressed_count = len(findings) - active_count
-        for f in findings:
+    for (package_org, package_name), all_findings in by_package.items():
+        trackable = [f for f in all_findings if not f.get("accepted_risk")]
+        accepted_count = len(all_findings) - len(trackable)
+
+        issue_refs = sync_package(args.tracking_repo, package_org, package_name, trackable, args.dry_run)
+        active_count = sum(1 for f in trackable if issue_refs.get(id(f), {}).get("state") == "open")
+        suppressed_count = len(trackable) - active_count
+        for f in trackable:
             f["issue"] = issue_refs.get(id(f))
         name = display_name(package_org, package_name)
         active_ref = next((r for r in issue_refs.values() if r["state"] == "open"), None)
         print(
-            f"{name}: {active_count} active, {suppressed_count} suppressed -> "
-            f"issue {active_ref.get('url') if active_ref else '(none open)'}",
+            f"{name}: {active_count} active, {suppressed_count} suppressed, {accepted_count} "
+            f"accepted-risk -> issue {active_ref.get('url') if active_ref else '(none open)'}",
             file=sys.stderr,
         )
 

@@ -20,6 +20,25 @@ Inputs, per configured version line:
   --vscode-status <branch>=ok|<error message>   whether ballerina-vscode's scan for that branch
                                          succeeded. Repeatable; if omitted for a branch that has
                                          a --vscode-report, assumed ok.
+  --dist-trivyignore <line>=<path>      ballerina-distribution's OWN per-branch .trivyignore for
+                                         that line (fetched from the real, actively-maintained
+                                         file in ballerina-platform/ballerina-distribution@<line>).
+                                         Applied to BOTH distribution and central findings for
+                                         that line - one shared accepted-risk list per line, not
+                                         per-package (see module docstring below on why). Repeatable.
+  --vscode-trivyignore <branch>=<path>  ballerina-vscode's own .trivyignore file(s) for that
+                                         branch (the fs scan's repo+submodule files, the ls scan's
+                                         language-server one) - merged per branch. Repeatable.
+
+Accepted-risk handling: a finding whose CVE appears in the relevant .trivyignore is NEVER
+dropped - it's tagged with `accepted_risk: {reason, source}` (reason = the comment text above
+that CVE in the file) and still flows through to combined.json like any other finding, so the
+dashboard can render it distinctly rather than it silently vanishing. This mirrors exactly how a
+closed GitHub issue works (see issue_sync.py) - a decision that's already been made and
+documented, not something to hide. Trivy's own `--ignorefile`/`--show-suppressed` are NOT used
+for this (verified: `--show-suppressed` does not actually restore suppressed entries to JSON
+output in the installed trivy version) - every scan runs with no ignorefile at all, and this
+script does the suppression/classification itself in one place for every source.
 
 Package identity is (package_org, package_name) - "ballerina-lang" (package_org=None) for
 distribution-source findings, or the actual Central org/name (e.g. "ballerinax"/"redis") for
@@ -79,6 +98,43 @@ def parse_trivy_report(path):
             )
 
 
+def parse_trivyignore(text):
+    """
+    Parses Trivy's plain one-ID-per-line .trivyignore format into {cve_or_ghsa_id: reason}.
+    A '# comment' line sets the reason for every bare ID line that follows, until the next
+    comment line resets it - matches the real format observed in ballerina-distribution's and
+    ballerina-vscode's actual files (one comment block, then one or more IDs, e.g.:
+    "# Axiom version is not released yet\nCVE-2024-21742"). Blank lines are just separators.
+    """
+    reasons = {}
+    current_reason = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            current_reason = line.lstrip("#").strip()
+            continue
+        vuln_id = line.split()[0]  # defensive: ignore any trailing content on an ID line
+        reasons[vuln_id] = current_reason or "(no reason given in .trivyignore)"
+    return reasons
+
+
+def load_trivyignore(path):
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return parse_trivyignore(f.read())
+
+
+def load_merged_trivyignore(paths):
+    """Merges multiple .trivyignore files (e.g. a repo's own + its submodule's) into one map."""
+    merged = {}
+    for path in paths or []:
+        merged.update(load_trivyignore(path))
+    return merged
+
+
 def dedupe_within_source(raw_findings, dedupe_key_fn):
     """
     raw_findings: list of dicts already carrying all schema fields except dedup bookkeeping.
@@ -100,11 +156,16 @@ def dedupe_within_source(raw_findings, dedupe_key_fn):
     return [by_key[k] for k in order]
 
 
-def process_distribution_report(line, report_path, findings_out):
+def _apply_accepted_risk(finding, ignore_map, ignore_source):
+    if ignore_map and finding["cve"] in ignore_map:
+        finding["accepted_risk"] = {"reason": ignore_map[finding["cve"]], "source": ignore_source}
+
+
+def process_distribution_report(line, report_path, ignore_map, ignore_source, findings_out):
     raw = []
     for target, cve, severity, trivy_pkg_name, installed, fixed in parse_trivy_report(report_path):
         jar = os.path.basename(target)
-        raw.append({
+        finding = {
             "ballerina_version": line,
             "source": "distribution",
             "package_org": None,
@@ -116,12 +177,14 @@ def process_distribution_report(line, report_path, findings_out):
             "severity": severity,
             "installed_version": installed,
             "fixed_version": fixed,
-        })
+        }
+        _apply_accepted_risk(finding, ignore_map, ignore_source)
+        raw.append(finding)
     deduped = dedupe_within_source(raw, lambda f: (f["cve"], f["library_name"], f["installed_version"]))
     findings_out.extend(deduped)
 
 
-def process_vscode_report(branch, report_paths, findings_out):
+def process_vscode_report(branch, report_paths, ignore_map, ignore_source, findings_out):
     """
     ballerina-vscode findings have NO Ballerina version at all - they're scanned by branch
     (configurable via trivy-vuln-scan/vscode-targets.json), independent of the 2201.x lines.
@@ -135,7 +198,7 @@ def process_vscode_report(branch, report_paths, findings_out):
     raw = []
     for report_path in report_paths:
         for target, cve, severity, trivy_pkg_name, installed, fixed in parse_trivy_report(report_path):
-            raw.append({
+            finding = {
                 "ballerina_version": None,
                 "source": "vscode-extension",
                 "package_org": None,
@@ -148,12 +211,14 @@ def process_vscode_report(branch, report_paths, findings_out):
                 "severity": severity,
                 "installed_version": installed,
                 "fixed_version": fixed,
-            })
+            }
+            _apply_accepted_risk(finding, ignore_map, ignore_source)
+            raw.append(finding)
     deduped = dedupe_within_source(raw, lambda f: (f["cve"], f["library_name"], f["installed_version"]))
     findings_out.extend(deduped)
 
 
-def process_central_dir(line, central_dir, findings_out):
+def process_central_dir(line, central_dir, ignore_map, ignore_source, findings_out):
     manifest_path = os.path.join(central_dir, "manifest.json")
     with open(manifest_path) as f:
         manifest = json.load(f)
@@ -165,7 +230,7 @@ def process_central_dir(line, central_dir, findings_out):
         raw = []
         for target, cve, severity, trivy_pkg_name, installed, fixed in parse_trivy_report(report_path):
             jar = os.path.basename(target)
-            raw.append({
+            finding = {
                 "ballerina_version": line,
                 "source": "central",
                 "package_org": pkg["org"],
@@ -177,7 +242,9 @@ def process_central_dir(line, central_dir, findings_out):
                 "severity": severity,
                 "installed_version": installed,
                 "fixed_version": fixed,
-            })
+            }
+            _apply_accepted_risk(finding, ignore_map, ignore_source)
+            raw.append(finding)
         deduped = dedupe_within_source(raw, lambda f: f["cve"])
         findings_out.extend(deduped)
 
@@ -222,6 +289,8 @@ def main():
     ap.add_argument("--central-status", action="append", default=[])
     ap.add_argument("--vscode-report", action="append", default=[])
     ap.add_argument("--vscode-status", action="append", default=[])
+    ap.add_argument("--dist-trivyignore", action="append", default=[])
+    ap.add_argument("--vscode-trivyignore", action="append", default=[])
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -231,15 +300,22 @@ def main():
     central_status = parse_kv_args(args.central_status)
     vscode_reports = parse_kv_list_args(args.vscode_report)
     vscode_status = parse_kv_args(args.vscode_status)
+    dist_trivyignore_paths = parse_kv_args(args.dist_trivyignore)
+    vscode_trivyignore_paths = parse_kv_list_args(args.vscode_trivyignore)
 
     findings = []
     scan_status = []
     versions = sorted(set(list(dist_reports) + list(central_dirs)))
 
     for line in versions:
+        # Same shared per-line ballerina-distribution file for BOTH distribution and central
+        # findings on this line - confirmed design, not a per-package/per-source ignorefile.
+        line_ignore_map = load_trivyignore(dist_trivyignore_paths.get(line))
+        line_ignore_source = f"ballerina-distribution:.trivyignore@{line}"
+
         if line in dist_reports:
             try:
-                process_distribution_report(line, dist_reports[line], findings)
+                process_distribution_report(line, dist_reports[line], line_ignore_map, line_ignore_source, findings)
                 ok = dist_status.get(line, "ok") == "ok"
                 scan_status.append({
                     "ballerina_version": line, "source": "distribution",
@@ -258,7 +334,7 @@ def main():
 
         if line in central_dirs:
             try:
-                process_central_dir(line, central_dirs[line], findings)
+                process_central_dir(line, central_dirs[line], line_ignore_map, line_ignore_source, findings)
                 ok = central_status.get(line, "ok") == "ok"
                 scan_status.append({
                     "ballerina_version": line, "source": "central",
@@ -278,8 +354,10 @@ def main():
     # ballerina-vscode is scanned by branch, independent of the Ballerina version lines above -
     # not added to `versions` (that field is specifically Ballerina release lines).
     for branch in sorted(vscode_reports):
+        branch_ignore_map = load_merged_trivyignore(vscode_trivyignore_paths.get(branch))
+        branch_ignore_source = f"ballerina-vscode:.trivyignore@{branch}"
         try:
-            process_vscode_report(branch, vscode_reports[branch], findings)
+            process_vscode_report(branch, vscode_reports[branch], branch_ignore_map, branch_ignore_source, findings)
             ok = vscode_status.get(branch, "ok") == "ok"
             scan_status.append({
                 "ballerina_version": None, "plugin_branch": branch, "source": "vscode-extension",

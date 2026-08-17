@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useState} from "react";
 import "./App.css";
 import {fetchSummary, triggerRefresh} from "./api";
+import AcceptedRiskSummary from "./components/AcceptedRiskSummary";
 import PackageTable from "./components/PackageTable";
 import ThemeToggle from "./components/ThemeToggle";
 import useAuth, {login, logout} from "./hooks/useAuth";
@@ -133,6 +134,8 @@ function App() {
               <a href={data.runUrl} target="_blank" rel="noreferrer">last known-good run</a>.
             </div>
           )}
+
+          <AcceptedRiskSummary byLine={data.acceptedRiskByLine} />
 
           <section className="findings">
             <div className="findings-tabs" role="tablist">

@@ -131,6 +131,38 @@
       "issue": null
     },
     {
+      "ballerina_version": "2201.13.x",
+      "source": "distribution",
+      "package_org": null,
+      "package_name": "ballerina-lang",
+      "package_version": null,
+      "library_name": "com.fasterxml.jackson.core:jackson-databind",
+      "jar": "jackson-databind-2.18.6.jar",
+      "cve": "CVE-2025-48924",
+      "severity": "HIGH",
+      "installed_version": "2.18.6",
+      "fixed_version": "2.18.8",
+      "also_seen_in_jars": [],
+      "issue": null,
+      "accepted_risk": {"reason": "Need to be fixed", "source": "ballerina-distribution:.trivyignore@2201.13.x"}
+    },
+    {
+      "ballerina_version": "2201.12.x",
+      "source": "central",
+      "package_org": "ballerinax",
+      "package_name": "redis",
+      "package_version": "3.4.0",
+      "library_name": "org.apache.commons:commons-compress",
+      "jar": "commons-compress-1.24.0.jar",
+      "cve": "CVE-2024-25710",
+      "severity": "MEDIUM",
+      "installed_version": "1.24.0",
+      "fixed_version": "1.26.0",
+      "also_seen_in_jars": [],
+      "issue": null,
+      "accepted_risk": {"reason": "The commons-compress library has backward incompatible changes", "source": "ballerina-distribution:.trivyignore@2201.12.x"}
+    },
+    {
       "ballerina_version": null,
       "source": "vscode-extension",
       "package_org": null,
