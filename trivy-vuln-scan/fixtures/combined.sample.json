@@ -163,6 +163,21 @@
       "accepted_risk": {"reason": "The commons-compress library has backward incompatible changes", "source": "ballerina-distribution:.trivyignore@2201.12.x"}
     },
     {
+      "ballerina_version": "2201.12.x",
+      "source": "central",
+      "package_org": "ballerinax",
+      "package_name": "aws.s3",
+      "package_version": "2.1.0",
+      "library_name": "com.amazonaws:aws-java-sdk-core",
+      "jar": "aws-java-sdk-core-1.12.400.jar",
+      "cve": "CVE-2024-99999",
+      "severity": "HIGH",
+      "installed_version": "1.12.400",
+      "fixed_version": "1.12.500",
+      "also_seen_in_jars": [],
+      "issue": { "number": 5, "url": "https://github.com/Thevakumar-Luheerathan/integration-engineering/issues/5", "state": "closed", "created_at": "2026-07-01T00:00:00Z" }
+    },
+    {
       "ballerina_version": null,
       "source": "vscode-extension",
       "package_org": null,

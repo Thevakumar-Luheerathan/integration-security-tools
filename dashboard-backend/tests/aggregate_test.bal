@@ -57,10 +57,11 @@ function testSeverityCountsMatchFixture() returns error? {
     VersionSourceSummary[] summaries = summarizeByVersionAndSource(report);
 
     // 2201.12.x/central in the fixture: netty-codec (HIGH) + netty-codec-http (HIGH) +
-    // bcprov/redis (CRITICAL) + rocketmq (MEDIUM) = 2 HIGH, 1 CRITICAL.
+    // aws.s3 closed-but-still-detected (HIGH) + bcprov/redis (CRITICAL) + rocketmq (MEDIUM)
+    // = 3 HIGH, 1 CRITICAL.
     foreach var s in summaries {
         if s.ballerina_version == "2201.12.x" && s.'source == "central" {
-            test:assertEquals(s.counts.high, 2);
+            test:assertEquals(s.counts.high, 3);
             test:assertEquals(s.counts.critical, 1);
         }
     }
@@ -139,7 +140,7 @@ function testSummarizeByPackageNeverProducesAnUnresolvedBucket() returns error? 
     // There is no repo-resolution step left to fail (confirmed design decision) - every finding
     // has a real package_org/package_name by construction, so no package summary should ever
     // need an "(unresolved)" placeholder the way the old repo-keyed view did.
-    test:assertEquals(packages.length(), 4, msg = "expected exactly 4 distinct packages in the fixture");
+    test:assertEquals(packages.length(), 5, msg = "expected exactly 5 distinct packages in the fixture");
     foreach var p in packages {
         test:assertTrue(p.package_name.length() > 0, msg = "package_name must never be empty/placeholder");
         test:assertFalse(p.package_name == "(unresolved)");
@@ -158,9 +159,9 @@ function testSummarizeByPackageExcludesVscodeExtension() returns error? {
     PackageSummary[] packages = summarizeByPackage(report);
 
     // The fixture's 2 vscode-extension findings must never appear in the Packages view - they
-    // belong exclusively to summarizeByPlugin (see below). Package count stays at 4 regardless
+    // belong exclusively to summarizeByPlugin (see below). Package count stays at 5 regardless
     // of the vscode-extension findings added to the fixture.
-    test:assertEquals(packages.length(), 4);
+    test:assertEquals(packages.length(), 5);
     PackageSummary? vscode = findPackage(packages, (), "ballerina-vscode");
     test:assertTrue(vscode is (), msg = "ballerina-vscode must not appear in the Packages view");
 }
@@ -223,6 +224,44 @@ function testAcceptedRiskFindingsAreNeverDroppedFromTheTree() returns error? {
     // on 2201.13.x, and CVE-2025-48734 on 2201.12.x - all issue #2) plus this 1 accepted-risk one.
     test:assertEquals(langPkg.issueSummary.acceptedRiskCount, 1);
     test:assertEquals(langPkg.issueSummary.openCount, 3);
+}
+
+@test:Config {}
+function testClosedButStillDetectedFindingStaysVisibleAndIsNeverCountedAsOpen() returns error? {
+    // ballerinax/aws.s3's fixture finding (CVE-2024-99999) models the scenario this whole
+    // project exists to make visible: a human closed issue #5 believing the fix was already
+    // shipped, but the SAME CVE is still being detected by this run (fix not yet published, or
+    // won't-fix). issue_sync.py's suppress-on-recurrence logic (see its sync_package()) never
+    // reopens the issue or creates a new one for it - it just re-attaches the closed issue ref
+    // so the dashboard can show it as "closed" rather than silently vanishing or looking active.
+    model:CombinedReport report = check loadFixture();
+    PackageSummary[] packages = summarizeByPackage(report);
+
+    PackageSummary? aws = findPackage(packages, "ballerinax", "aws.s3");
+    test:assertTrue(aws is PackageSummary, msg = "expected the closed-but-still-detected fixture package to appear");
+    PackageSummary awsPkg = <PackageSummary>aws;
+
+    model:Finding? closedFinding = ();
+    foreach var v in awsPkg.versions {
+        foreach var f in v.findings {
+            if f.cve == "CVE-2024-99999" {
+                closedFinding = f;
+            }
+        }
+    }
+    test:assertTrue(closedFinding is model:Finding,
+            msg = "a finding matching a closed issue must still appear in the version tree, never dropped");
+    model:IssueRef? issue = (<model:Finding>closedFinding).issue;
+    test:assertTrue(issue is model:IssueRef);
+    test:assertEquals((<model:IssueRef>issue).state, "closed");
+    test:assertEquals((<model:IssueRef>issue).number, 5);
+
+    // The whole point: this must count as CLOSED, never as open (a human already made the call
+    // that this issue is resolved/acknowledged) and never as accepted-risk (that's a distinct,
+    // .trivyignore-driven state - this finding has no accepted_risk tag at all).
+    test:assertEquals(awsPkg.issueSummary.closedCount, 1);
+    test:assertEquals(awsPkg.issueSummary.openCount, 0);
+    test:assertEquals(awsPkg.issueSummary.acceptedRiskCount, 0);
 }
 
 @test:Config {}
