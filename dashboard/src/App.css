@@ -467,6 +467,11 @@
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  /* Without this, a grid/flex item defaults to min-width: auto - its intrinsic content width -
+     and ignores the track's own width. A long comma-separated fixed_version list (multiple fix
+     versions) would then push past the "detail" column's allocated width and visually collide
+     with the issue-cell badge next to it, instead of the long text truncating in place. */
+  min-width: 0;
 }
 
 .tree-cell-issue {
@@ -535,15 +540,29 @@
   font-family: var(--font-mono);
   font-size: 0.78rem;
   color: var(--ink-muted);
+  min-width: 0; /* same reason as .tree-cell-detail above - let this flex item actually shrink */
+}
+
+.cve-installed {
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .cve-fixed {
   color: var(--low);
+  /* The one part of this row with genuinely unbounded length (trivy can report several fix
+     versions, comma-separated) - truncate it in place rather than letting it overflow into the
+     issue-cell badge. Full text is still available via the title tooltip (see PackageTable.jsx). */
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cve-arrow {
   opacity: 0.5;
+  flex-shrink: 0;
 }
 
 .version-cve-count {

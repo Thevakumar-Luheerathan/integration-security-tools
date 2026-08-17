@@ -106,7 +106,7 @@ function CveRow({finding, ancestorsLast, isLast}) {
         <span className="cve-versions">
           <span className="cve-installed">{finding.installed_version}</span>
           <span className="cve-arrow">&rarr;</span>
-          <span className="cve-fixed">{finding.fixed_version || "no fix yet"}</span>
+          <span className="cve-fixed" title={finding.fixed_version || "no fix yet"}>{finding.fixed_version || "no fix yet"}</span>
         </span>
       </div>
       <div className="tree-cell tree-cell-issue">
