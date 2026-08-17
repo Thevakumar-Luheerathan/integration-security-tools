@@ -100,8 +100,8 @@ function App() {
       {!auth.loading && !auth.authenticated && (
         <div className="state-panel state-login">
           <p className="state-title">Sign in required</p>
-          <p>This dashboard is restricted to the security team.</p>
-          <button className="btn-refresh" onClick={login}>Sign in</button>
+          <p>Sign in with your WSO2 Google Workspace account. Access is limited to the security team.</p>
+          <button className="btn-refresh" onClick={login}>Sign in with WSO2</button>
         </div>
       )}
 
