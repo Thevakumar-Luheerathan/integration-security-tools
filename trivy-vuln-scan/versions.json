@@ -10,7 +10,7 @@
     },
     {
       "line": "2201.12.x",
-      "active": false,
+      "active": true,
       "lang_branch": "2201.12.x",
       "distribution_tag": "v2201.12.12",
       "jdk_version": "21.0.3"
