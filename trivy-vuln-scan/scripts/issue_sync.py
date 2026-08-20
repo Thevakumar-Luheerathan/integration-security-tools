@@ -189,6 +189,14 @@ def render_body(package_org, package_name, findings, suppressed_count):
     the findings active at creation time only; it will not stay in sync as the issue evolves.
     """
     name = display_name(package_org, package_name)
+    # Where an unfixed CVE should be documented via .trivyignore before closing - the vscode
+    # extension is tracked in its own repo/branch, everything else (distribution + Central, for
+    # every Ballerina version line) is tracked in ballerina-distribution's per-line branch.
+    trivyignore_target = (
+        "ballerina-vscode's own branch"
+        if package_name == "ballerina-vscode"
+        else "ballerina-distribution's branch for this Ballerina version line"
+    )
     lines = [
         f"Automatically tracked vulnerabilities for `{name}`.",
         "",
@@ -200,9 +208,14 @@ def render_body(package_org, package_name, findings, suppressed_count):
         "**How acknowledgement works:**",
         "",
         "- Acknowledging a finding means **closing this issue** - there's no separate flag or "
-        "label, closing IS the acknowledgment.",
+        "label, closing this issue is the acknowledgment.",
         "- Close this issue once you've made a call on it: already fixed upstream (release "
         "pending), won't-fix, tracked elsewhere, accepted risk, etc.",
+        f"- **If a CVE will not actually be fixed** (or won't be fixed soon), also add it to "
+        f"`.trivyignore` (with a reason) in {trivyignore_target} before closing - that documents "
+        f"it as a deliberate, accepted risk instead of silently suppressing it with no paper "
+        f"trail. Once it's in `.trivyignore`, future scans will tag it `accepted_risk` directly "
+        f"and it will stop appearing in issues/comments at all.",
         "- Once closed, every CVE mentioned in this issue (body + comments) is treated as "
         "acknowledged - if the exact same CVE shows up again in a future scan, it is silently "
         "suppressed, not reopened and not re-surfaced as a new issue.",
