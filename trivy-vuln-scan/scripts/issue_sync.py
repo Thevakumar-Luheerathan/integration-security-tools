@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Sync combined.json findings to GitHub issues, one issue per PACKAGE (not per repo, not per CVE),
-in a tracking repo (currently Thevakumar-Luheerathan/integration-engineering - the user's fork;
-migrating to the upstream wso2-enterprise/integration-engineering later is a --tracking-repo +
-token swap only).
+in a tracking repo (wso2-enterprise/integration-engineering, the real upstream tracker - it lived
+at Thevakumar-Luheerathan/integration-engineering, a personal fork, while this pipeline itself was
+being built/tested; migrating was just a --tracking-repo + token-access swap, no redesign).
 
 Design (confirmed with user):
   - One issue per package, keyed on (package_org, package_name) - e.g. "ballerinax"/"redis", or
@@ -436,7 +436,7 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run, pa
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--combined", required=True, help="combined.json to read AND update in place")
-    ap.add_argument("--tracking-repo", default="Thevakumar-Luheerathan/integration-engineering")
+    ap.add_argument("--tracking-repo", default="wso2-enterprise/integration-engineering")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 

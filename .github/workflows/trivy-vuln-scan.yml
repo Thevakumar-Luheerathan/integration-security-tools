@@ -23,12 +23,12 @@ name: Trivy Vulnerability Scan
 # To add a new version line: edit trivy-vuln-scan/versions.json. To add/change a
 # ballerina-vscode branch: edit trivy-vuln-scan/vscode-targets.json. No workflow changes needed.
 #
-# NOTE (temporary, per user decision): issues are filed into
-# Thevakumar-Luheerathan/integration-engineering (a personal fork) rather than the upstream
-# wso2-enterprise/integration-engineering, using a personal token (secrets.CROSS_REPO_TOKEN) with
-# cross-repo issue write access, since this workflow's default GITHUB_TOKEN has no access outside
-# the repo it runs in. Migrating to the upstream tracking repo later is a --tracking-repo value +
-# secret swap, not a redesign.
+# Issues are filed into wso2-enterprise/integration-engineering (the real upstream tracker) using
+# a personal cross-repo token (secrets.CROSS_REPO_TOKEN), since this workflow's default
+# GITHUB_TOKEN has no access outside the repo it runs in. This previously pointed at
+# Thevakumar-Luheerathan/integration-engineering (a personal fork) while the pipeline itself was
+# being built and tested - migrating was just this --tracking-repo value + confirming the token
+# has access on the real repo, no redesign.
 #
 # This subsystem previously lived at Thevakumar-Luheerathan/ballerina-distribution's
 # .github/vuln-scan/ - moved here since it has no real dependency on that repo (it only checks
@@ -500,12 +500,12 @@ jobs:
         env:
           # A personal-account token with issue read/write on the tracking repo. Required
           # because this workflow's default GITHUB_TOKEN has no access outside the repo it
-          # runs in. Add this secret before enabling the schedule trigger for real.
+          # runs in.
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
           python3 trivy-vuln-scan/scripts/issue_sync.py \
             --combined combined.json \
-            --tracking-repo Thevakumar-Luheerathan/integration-engineering
+            --tracking-repo wso2-enterprise/integration-engineering
 
       - uses: actions/upload-artifact@v4
         with:
