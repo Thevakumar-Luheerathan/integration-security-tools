@@ -47,6 +47,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 LABEL = "trivy-scan"
+PARENT_LABEL = "trivy-scan-parent"
+PARENT_TITLE = "[Trivy] Vulnerability tracking - parent issue"
 CVE_ID_RE = re.compile(r"(CVE-\d{4}-\d+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})", re.IGNORECASE)
 
 
@@ -59,13 +61,13 @@ def gh(args, input_text=None):
     return proc.stdout
 
 
-def ensure_label_exists(tracking_repo):
+def ensure_label_exists(tracking_repo, label, color, description):
     existing = gh(["label", "list", "--repo", tracking_repo, "--json", "name"])
     names = {item["name"] for item in json.loads(existing)}
-    if LABEL not in names:
+    if label not in names:
         gh([
-            "label", "create", LABEL, "--repo", tracking_repo,
-            "--color", "B60205", "--description", "Auto-filed by the Ballerina vulnerability scan pipeline",
+            "label", "create", label, "--repo", tracking_repo,
+            "--color", color, "--description", description,
         ])
 
 
@@ -108,6 +110,69 @@ def find_package_issues(tracking_repo, title):
         open_issue = max(open_issues, key=lambda i: i["updatedAt"])
 
     return open_issue, closed_issues
+
+
+def find_or_create_parent_issue(tracking_repo, dry_run):
+    """
+    The single, ongoing parent issue every newly-created package issue gets attached to as a
+    real GitHub sub-issue (see add_sub_issue) - found by its dedicated PARENT_LABEL, not by
+    title text matching (unlike find_package_issues), since there's only ever meant to be one
+    of these and a distinct label is a more robust lookup than a title search. Returns its issue
+    number, or None in dry-run mode (nothing was actually created/found to attach to).
+    """
+    result = gh([
+        "issue", "list", "--repo", tracking_repo, "--label", PARENT_LABEL,
+        "--state", "open", "--json", "number,title",
+    ])
+    matches = [i for i in json.loads(result) if i["title"] == PARENT_TITLE]
+    if matches:
+        return matches[0]["number"]
+
+    if dry_run:
+        print("[dry-run] would CREATE the parent tracking issue", file=sys.stderr)
+        return None
+
+    body = (
+        "Parent tracking issue for the Ballerina proactive vulnerability scan pipeline - every "
+        "per-package issue the pipeline creates is linked below as a sub-issue.\n\n"
+        "- Each sub-issue is independently created, updated, and closed by the pipeline exactly "
+        "as described in its own body - this parent doesn't change any of that, it exists "
+        "purely to give one place to see everything at a glance (GitHub tracks the open/closed "
+        "sub-issue count and progress bar automatically once they're linked).\n"
+        "- Closing a sub-issue acknowledges that package's findings, per its own body - it has "
+        "no effect on this parent, which stays open indefinitely.\n"
+        "- New package issues the pipeline creates going forward are linked here automatically "
+        "as they're created."
+    )
+    out = gh([
+        "issue", "create", "--repo", tracking_repo, "--title", PARENT_TITLE,
+        "--body", body, "--label", LABEL, "--label", PARENT_LABEL,
+    ])
+    url = out.strip().splitlines()[-1]
+    return int(url.rstrip("/").rsplit("/", 1)[-1])
+
+
+def add_sub_issue(tracking_repo, parent_number, child_number, dry_run):
+    """
+    Attaches child_number as a real GitHub sub-issue of parent_number - only ever called right
+    after create_issue() for a BRAND NEW package issue (not on every sync of an already-existing
+    one, and not for closed/suppressed findings). GitHub's sub-issue API is asymmetric: the
+    parent is addressed by its issue NUMBER (repo-scoped) in the URL path, but the child must be
+    given by its internal database ID (globally unique, NOT the same as its issue number) in the
+    request body - hence the extra lookup below.
+
+    Failure here is logged and swallowed, never raised: the child issue itself was already
+    created successfully by this point and is fully valid/tracked on its own - losing just the
+    visual sub-issue grouping is a cosmetic degradation, not a reason to fail the whole sync run.
+    """
+    if dry_run or parent_number is None:
+        print(f"[dry-run] would attach issue #{child_number} as a sub-issue of parent #{parent_number}", file=sys.stderr)
+        return
+    try:
+        child_id = int(gh(["api", f"repos/{tracking_repo}/issues/{child_number}", "--jq", ".id"]).strip())
+        gh(["api", "--method", "POST", f"repos/{tracking_repo}/issues/{parent_number}/sub_issues", "-F", f"sub_issue_id={child_id}"])
+    except RuntimeError as e:
+        print(f"WARNING: failed to attach issue #{child_number} as a sub-issue of parent #{parent_number}: {e}", file=sys.stderr)
 
 
 def extract_cve_ids(text):
@@ -311,10 +376,16 @@ def close_issue(tracking_repo, issue, dry_run):
     gh(["issue", "close", str(issue["number"]), "--repo", tracking_repo])
 
 
-def sync_package(tracking_repo, package_org, package_name, findings, dry_run):
+def sync_package(tracking_repo, package_org, package_name, findings, dry_run, parent_number):
     """
     Returns a dict mapping each finding's id(finding) -> issue ref, per the lifecycle described
     in the module docstring. Never reopens or rewrites a closed issue.
+
+    parent_number is the ongoing parent tracking issue (see find_or_create_parent_issue) - only
+    ever used right below, when this package's issue is BRAND NEW (create_issue branch). An
+    already-existing open issue was already attached to the parent the run it was created, so
+    re-attaching it every subsequent sync would be redundant (and GitHub would just reject the
+    duplicate sub-issue link anyway).
     """
     title = issue_title(package_org, package_name)
     open_issue, closed_issues = find_package_issues(tracking_repo, title)
@@ -346,6 +417,7 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run):
                 ref = issue_ref(open_issue)
         else:
             ref = create_issue(tracking_repo, package_org, package_name, active, dry_run)
+            add_sub_issue(tracking_repo, parent_number, ref["number"], dry_run)
         for f in active:
             issue_refs[id(f)] = ref
     elif open_issue:
@@ -371,7 +443,11 @@ def main():
     with open(args.combined) as f:
         combined = json.load(f)
 
-    ensure_label_exists(args.tracking_repo)
+    ensure_label_exists(args.tracking_repo, LABEL, "B60205", "Auto-filed by the Ballerina vulnerability scan pipeline")
+    ensure_label_exists(args.tracking_repo, PARENT_LABEL, "5319E7", "The parent tracking issue linking all trivy-scan sub-issues")
+    # Found/created ONCE per run, not per package - every brand-new package issue this run
+    # attaches to this same parent (see sync_package's create_issue branch).
+    parent_number = find_or_create_parent_issue(args.tracking_repo, args.dry_run)
 
     for finding in combined["findings"]:
         finding.setdefault("issue", None)
@@ -391,7 +467,7 @@ def main():
         trackable = [f for f in all_findings if not f.get("accepted_risk")]
         accepted_count = len(all_findings) - len(trackable)
 
-        issue_refs = sync_package(args.tracking_repo, package_org, package_name, trackable, args.dry_run)
+        issue_refs = sync_package(args.tracking_repo, package_org, package_name, trackable, args.dry_run, parent_number)
         active_count = sum(1 for f in trackable if issue_refs.get(id(f), {}).get("state") == "open")
         suppressed_count = len(trackable) - active_count
         for f in trackable:
