@@ -62,7 +62,13 @@ def gh(args, input_text=None):
 
 
 def ensure_label_exists(tracking_repo, label, color, description):
-    existing = gh(["label", "list", "--repo", tracking_repo, "--json", "name"])
+    # --limit is required, not cosmetic: `gh label list` defaults to a 30-item page, which was
+    # invisible on the small personal testing fork (a handful of labels total) but silently
+    # broke the very first real run against the actual upstream org repo - it already had 110
+    # labels, trivy-scan/trivy-scan-parent existed but sorted outside the default page, so this
+    # wrongly concluded they didn't exist and then failed trying to (re)create them. 1000 is
+    # comfortably above any repo's real label count.
+    existing = gh(["label", "list", "--repo", tracking_repo, "--json", "name", "--limit", "1000"])
     names = {item["name"] for item in json.loads(existing)}
     if label not in names:
         gh([
@@ -97,7 +103,7 @@ def find_package_issues(tracking_repo, title):
     result = gh([
         "issue", "list", "--repo", tracking_repo, "--label", LABEL,
         "--state", "all", "--search", f'"{title}" in:title',
-        "--json", "number,title,state,url,body,updatedAt,createdAt",
+        "--json", "number,title,state,url,body,updatedAt,createdAt", "--limit", "1000",
     ])
     matches = [item for item in json.loads(result) if item["title"] == title]
 
@@ -122,7 +128,7 @@ def find_or_create_parent_issue(tracking_repo, dry_run):
     """
     result = gh([
         "issue", "list", "--repo", tracking_repo, "--label", PARENT_LABEL,
-        "--state", "open", "--json", "number,title",
+        "--state", "open", "--json", "number,title", "--limit", "1000",
     ])
     matches = [i for i in json.loads(result) if i["title"] == PARENT_TITLE]
     if matches:
