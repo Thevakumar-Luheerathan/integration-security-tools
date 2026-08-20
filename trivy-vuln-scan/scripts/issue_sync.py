@@ -116,6 +116,32 @@ def extract_cve_ids(text):
     return {m.group(1) for m in CVE_ID_RE.finditer(text)}
 
 
+def fetch_issue_comment_bodies(tracking_repo, issue_number):
+    result = gh(["issue", "view", str(issue_number), "--repo", tracking_repo, "--json", "comments"])
+    return [c["body"] for c in json.loads(result).get("comments", [])]
+
+
+def known_cve_ids(tracking_repo, issue):
+    """
+    Every CVE already surfaced for this issue - from its body (only ever written at creation time
+    now, see render_body/create_issue) UNION every comment posted on it since (new-finding
+    comments from comment_new_findings, the close comment from close_issue, etc.).
+
+    Needed because the body is no longer kept in sync after creation - it used to be the single
+    source of truth for "what's already been reported here", rewritten in full on every run. Now
+    that ongoing updates are comments instead, a CVE that only ever arrived via a comment (never
+    in the body) still has to count as "already known" - both for the open issue (so a routine
+    re-run doesn't re-comment about a finding that's still there) and for a CLOSED issue (so
+    suppress-on-recurrence in sync_package still recognizes it if the same CVE reappears later -
+    otherwise it would incorrectly look "new" and get its own fresh issue instead of being
+    suppressed as already-acknowledged).
+    """
+    ids = extract_cve_ids(issue.get("body"))
+    for comment_body in fetch_issue_comment_bodies(tracking_repo, issue["number"]):
+        ids |= extract_cve_ids(comment_body)
+    return ids
+
+
 def version_groups(package_name, findings):
     """
     Groups a package's findings into (label, findings) pairs per the package -> version -> CVE
@@ -157,11 +183,17 @@ def render_finding_row(f):
 
 
 def render_body(package_org, package_name, findings, suppressed_count):
+    """
+    Only ever called once, by create_issue() - an already-open issue's body is never rewritten
+    again (see comment_new_findings for how ongoing updates work instead). This snapshot reflects
+    the findings active at creation time only; it will not stay in sync as the issue evolves.
+    """
     name = display_name(package_org, package_name)
     lines = [
         f"Automatically tracked vulnerabilities for `{name}`, across all scanned versions/"
-        f"branches. This issue's body is fully rewritten on every pipeline run to reflect "
-        f"current ACTIVE findings - manual edits here will be overwritten.",
+        f"branches. This issue's body reflects the findings active when it was CREATED - it is "
+        f"never rewritten after that. New findings while this issue stays open are posted as "
+        f"comments instead (see below), not edits to this body.",
         "",
         "Closing this issue is a judgment call for a human to make (already fixed upstream but "
         "not yet published, won't-fix, tracked elsewhere, etc.) - the pipeline never reopens a "
@@ -210,13 +242,41 @@ def create_issue(tracking_repo, package_org, package_name, active_findings, dry_
     return {"number": number, "url": url, "state": "open", "created_at": created_at}
 
 
-def update_issue(tracking_repo, issue, package_org, package_name, active_findings, suppressed_count, dry_run):
-    body = render_body(package_org, package_name, active_findings, suppressed_count)
-    if dry_run:
-        print(f"[dry-run] would UPDATE issue #{issue['number']} ({len(active_findings)} active finding(s))", file=sys.stderr)
-    else:
-        gh(["issue", "edit", str(issue["number"]), "--repo", tracking_repo, "--body", body])
+def render_new_findings_comment(new_findings, suppressed_count):
+    lines = [f"**{len(new_findings)} new finding(s) detected in this scan:**", ""]
+    lines.append("| Jar | CVE | Severity | Installed | Fixed |")
+    lines.append("|---|---|---|---|---|")
+    for f in sorted(new_findings, key=lambda f: (f["severity"], f["cve"] or "")):
+        lines.append(render_finding_row(f))
+    if suppressed_count:
+        lines.append("")
+        lines.append(
+            f"_{suppressed_count} other finding(s) for this package matched a CVE already "
+            f"covered by a previously closed issue and are intentionally omitted._"
+        )
+    return "\n".join(lines)
+
+
+def issue_ref(issue):
     return {"number": issue["number"], "url": issue["url"], "state": "open", "created_at": issue.get("createdAt")}
+
+
+def comment_new_findings(tracking_repo, issue, new_findings, suppressed_count, dry_run):
+    """
+    Replaces the old update_issue()'s full-body rewrite: an already-open issue's body is now
+    written ONLY at creation time (see create_issue/render_body) and never touched again -
+    ongoing updates while it stays open are comments instead, one per sync run, listing only the
+    genuinely new finding(s) that triggered it. A run with no new findings for this issue (e.g. a
+    routine package_version bump with the same CVEs, or simply nothing changed) posts nothing at
+    all - this is the whole point of the switch: don't ping the issue on every single run the way
+    a full body rewrite implicitly did.
+    """
+    if dry_run:
+        print(f"[dry-run] would COMMENT on issue #{issue['number']} ({len(new_findings)} new finding(s))", file=sys.stderr)
+    else:
+        body = render_new_findings_comment(new_findings, suppressed_count)
+        gh(["issue", "comment", str(issue["number"]), "--repo", tracking_repo, "--body", body])
+    return issue_ref(issue)
 
 
 def close_issue(tracking_repo, issue, dry_run):
@@ -240,10 +300,13 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run):
 
     # Union of CVEs already covered by ANY closed issue for this package, plus a per-CVE map to
     # the most recent closed issue that mentioned it (for attaching a reference onto suppressed
-    # findings below).
+    # findings below). known_cve_ids (not extract_cve_ids(body) alone) is required here: a CVE
+    # may have only ever been surfaced via a comment on this issue while it was still open (see
+    # comment_new_findings), never written into the body itself - missing that would make a
+    # recurring CVE look "new" instead of being correctly suppressed as already-acknowledged.
     closed_cve_to_issue = {}
     for issue in sorted(closed_issues, key=lambda i: i["updatedAt"]):
-        for cve in extract_cve_ids(issue.get("body")):
+        for cve in known_cve_ids(tracking_repo, issue):
             closed_cve_to_issue[cve] = issue  # later (more recent) closed issues win on conflict
     closed_cves = set(closed_cve_to_issue.keys())
 
@@ -254,7 +317,12 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run):
 
     if active:
         if open_issue:
-            ref = update_issue(tracking_repo, open_issue, package_org, package_name, active, len(suppressed), dry_run)
+            already_known = known_cve_ids(tracking_repo, open_issue)
+            new_findings = [f for f in active if f["cve"] not in already_known]
+            if new_findings:
+                ref = comment_new_findings(tracking_repo, open_issue, new_findings, len(suppressed), dry_run)
+            else:
+                ref = issue_ref(open_issue)
         else:
             ref = create_issue(tracking_repo, package_org, package_name, active, dry_run)
         for f in active:
