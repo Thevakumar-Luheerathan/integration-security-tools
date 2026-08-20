@@ -190,18 +190,26 @@ def render_body(package_org, package_name, findings, suppressed_count):
     """
     name = display_name(package_org, package_name)
     lines = [
-        f"Automatically tracked vulnerabilities for `{name}`, across all scanned versions/"
-        f"branches. This issue's body reflects the findings active when it was CREATED - it is "
-        f"never rewritten after that. New findings while this issue stays open are posted as "
-        f"comments instead (see below), not edits to this body.",
+        f"Automatically tracked vulnerabilities for `{name}`.",
         "",
-        "Closing this issue is a judgment call for a human to make (already fixed upstream but "
-        "not yet published, won't-fix, tracked elsewhere, etc.) - the pipeline never reopens a "
-        "closed issue and never rewrites its body. If the same CVE reappears in a later scan "
-        "after this issue is closed, it will be suppressed (not re-surfaced) rather than "
-        "reopening this issue, since a closed issue implies it's already been acknowledged - "
-        "most likely just waiting on a new package release. A genuinely different/new CVE for "
-        "this package will get its own fresh issue instead.",
+        f"- This issue's body reflects the findings active when it was **created** - it is "
+        f"never rewritten after that.",
+        f"- New findings detected while this issue stays open are posted as **comments below**, "
+        f"not edits to this body.",
+        "",
+        "**How acknowledgement works:**",
+        "",
+        "- Acknowledging a finding means **closing this issue** - there's no separate flag or "
+        "label, closing IS the acknowledgment.",
+        "- Close this issue once you've made a call on it: already fixed upstream (release "
+        "pending), won't-fix, tracked elsewhere, accepted risk, etc.",
+        "- Once closed, every CVE mentioned in this issue (body + comments) is treated as "
+        "acknowledged - if the exact same CVE shows up again in a future scan, it is silently "
+        "suppressed, not reopened and not re-surfaced as a new issue.",
+        "- A genuinely **different** CVE for this same package always gets its own fresh issue - "
+        "closing this one does not block future issues for this package.",
+        "- Once closed, this issue is never reopened and its body is never edited again by the "
+        "pipeline.",
     ]
     if suppressed_count:
         lines.append(
