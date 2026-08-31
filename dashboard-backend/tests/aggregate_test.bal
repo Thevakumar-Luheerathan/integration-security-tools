@@ -28,10 +28,11 @@ function testSummarizeByVersionAndSourceCoversEveryScanStatus() returns error? {
     model:CombinedReport report = check loadFixture();
     VersionSourceSummary[] summaries = summarizeByVersionAndSource(report);
 
-    // The fixture's scan_status lists 4 (version, source) pairs, including one with ok=false
-    // and zero findings for it. Every one of those 4 must appear - a failed/empty scan must
-    // never be indistinguishable from "not run at all".
-    test:assertEquals(summaries.length(), 4);
+    // The fixture's scan_status lists 6 (version, source) pairs (distribution x2, central x2,
+    // tools x2 - the vscode-extension row is skipped, it has no ballerina_version), including
+    // one with ok=false and zero findings for it. Every one of those 6 must appear - a
+    // failed/empty scan must never be indistinguishable from "not run at all".
+    test:assertEquals(summaries.length(), 6);
 
     VersionSourceSummary? failedOne = ();
     foreach var s in summaries {
@@ -160,10 +161,15 @@ function testSummarizeByPackageExcludesVscodeExtension() returns error? {
 
     // The fixture's 2 vscode-extension findings must never appear in the Packages view - they
     // belong exclusively to summarizeByPlugin (see below). Package count stays at 5 regardless
-    // of the vscode-extension findings added to the fixture.
+    // of the vscode-extension findings added to the fixture. This is now the allowlist fix's real
+    // regression guard too: summarizeByPackage used to be `!= "vscode-extension"`, which would
+    // have silently swept the fixture's 3 "tools" findings in here as well (count would be 7,
+    // not 5) - see testEverySourceBelongsToExactlyOneView below for the general form of this check.
     test:assertEquals(packages.length(), 5);
     PackageSummary? vscode = findPackage(packages, (), "ballerina-vscode");
     test:assertTrue(vscode is (), msg = "ballerina-vscode must not appear in the Packages view");
+    PackageSummary? tool = findPackage(packages, "ballerina", "tool_scan");
+    test:assertTrue(tool is (), msg = "a \"tools\"-source finding must not appear in the Packages view");
 }
 
 @test:Config {}
@@ -277,5 +283,89 @@ function testSummarizeAcceptedRiskByLine() returns error? {
     test:assertEquals(byLine[0].count, 1);
     test:assertEquals(byLine[1].ballerina_version, "2201.13.x");
     test:assertEquals(byLine[1].count, 1);
+}
+
+@test:Config {}
+function testSummarizeByToolIsSeparateFromPackagesAndPlugins() returns error? {
+    model:CombinedReport report = check loadFixture();
+    PackageSummary[] tools = summarizeByTool(report);
+
+    // Fixture has 2 distinct tools: ballerina/tool_scan (2 versions) and wso2/tool_migrate_tibco
+    // (1 version) - neither may leak into summarizeByPackage/summarizeByPlugin (see
+    // testSummarizeByPackageExcludesVscodeExtension's companion assertion, and
+    // testEverySourceBelongsToExactlyOneView below for the general partition check).
+    test:assertEquals(tools.length(), 2);
+    PackageSummary? scanTool = findPackage(tools, "ballerina", "tool_scan");
+    test:assertTrue(scanTool is PackageSummary, msg = "expected ballerina/tool_scan in the Tools view");
+
+    test:assertTrue(findPackage(summarizeByPackage(report), "ballerina", "tool_scan") is (),
+            msg = "a tool must never appear in the Packages view");
+    test:assertTrue(findPackage(summarizeByPlugin(report), "ballerina", "tool_scan") is (),
+            msg = "a tool must never appear in the Plugins view");
+}
+
+@test:Config {}
+function testSummarizeByToolGroupsByPackageVersionLikeACentralPackage() returns error? {
+    model:CombinedReport report = check loadFixture();
+    PackageSummary[] tools = summarizeByTool(report);
+
+    // ballerina/tool_scan has findings on 0.11.0 (2201.13.x) and 0.10.0 (2201.12.x) - buildVersionGroups
+    // needs NO special case for "tools": it already falls into the same default branch a Central
+    // package uses, since tools carry package_version/ballerina_version identically.
+    PackageSummary? scanTool = findPackage(tools, "ballerina", "tool_scan");
+    test:assertTrue(scanTool is PackageSummary);
+    PackageSummary scanToolPkg = <PackageSummary>scanTool;
+    test:assertEquals(scanToolPkg.versions.length(), 2, msg = "expected two VersionGroups, one per package_version");
+
+    foreach var v in scanToolPkg.versions {
+        test:assertTrue(v.package_version is string, msg = "a tool's VersionGroup must carry package_version just like a Central package's");
+        if v.package_version == "0.11.0" {
+            test:assertEquals(v.ballerina_versions, ["2201.13.x"]);
+        } else if v.package_version == "0.10.0" {
+            test:assertEquals(v.ballerina_versions, ["2201.12.x"]);
+        } else {
+            test:assertFail(string `unexpected package_version ${v.package_version ?: "()"}`);
+        }
+        // tool_id lives on each Finding (model:Finding), not on VersionGroup/PackageSummary -
+        // spot-check it survived cloneWithType() and is carried through to the leaf findings.
+        foreach var f in v.findings {
+            test:assertEquals(f.tool_id, "scan");
+        }
+    }
+}
+
+@test:Config {}
+function testEverySourceBelongsToExactlyOneView() returns error? {
+    // The general form of the allowlist-fix regression guard: whatever distinct `source` values
+    // exist in the fixture, each one's findings must appear in EXACTLY one of the three views -
+    // never zero (silently dropped) and never two (double-counted). This is what makes adding a
+    // future fifth source safe: this test fails loudly instead of a source silently landing in
+    // the wrong tab, the way "tools" would have under the old `!= "vscode-extension"` filter.
+    model:CombinedReport report = check loadFixture();
+    PackageSummary[] packages = summarizeByPackage(report);
+    PackageSummary[] plugins = summarizeByPlugin(report);
+    PackageSummary[] tools = summarizeByTool(report);
+
+    string[] sources = [];
+    foreach var f in report.findings {
+        if sources.indexOf(f.'source) is () {
+            sources.push(f.'source);
+        }
+    }
+    test:assertTrue(sources.length() >= 3, msg = "fixture should exercise at least distribution/central/tools/vscode-extension");
+
+    PackageSummary[][] views = [packages, plugins, tools];
+    foreach var 'source in sources {
+        int count = 0;
+        foreach var view in views {
+            foreach var p in view {
+                if p.'source == 'source {
+                    count += 1;
+                    break;
+                }
+            }
+        }
+        test:assertEquals(count, 1, msg = string `source "${'source}" must appear in exactly one view, found in ${count}`);
+    }
 }
 

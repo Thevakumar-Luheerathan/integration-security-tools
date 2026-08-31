@@ -3,6 +3,15 @@ import integration_security_tools/dashboard_backend.model;
 // Pure aggregation logic over a CombinedReport - no I/O, so this is the easiest part of the
 // service to unit-test directly (see tests/aggregate_test.bal).
 
+// Named once so the summarize* functions below can't drift from each other or from
+// combine.py/issue_sync.py's literal strings via a typo. The three summarize* functions using
+// these MUST partition report.findings - every source belongs to exactly one view, never zero
+// and never two (see tests/aggregate_test.bal's testEverySourceBelongsToExactlyOneView).
+const string SOURCE_DISTRIBUTION = "distribution";
+const string SOURCE_CENTRAL = "central";
+const string SOURCE_TOOLS = "tools";
+const string SOURCE_VSCODE = "vscode-extension";
+
 function bumpSeverity(SeverityCounts counts, string severity) returns SeverityCounts {
     SeverityCounts updated = counts.clone();
     string s = severity.toUpperAscii();
@@ -234,8 +243,13 @@ function groupIntoSummaries(model:Finding[] findings) returns PackageSummary[] {
         select p;
 }
 
+// Explicit ALLOWLIST, not "everything except vscode-extension" - the old negative filter meant
+// any newly-added source (this is exactly what happened when "tools" was added) would silently
+// land in the Packages view instead of its own. Central packages and distribution only.
 public function summarizeByPackage(model:CombinedReport report) returns PackageSummary[] {
-    model:Finding[] packageFindings = from var f in report.findings where f.'source != "vscode-extension" select f;
+    model:Finding[] packageFindings = from var f in report.findings
+        where f.'source == SOURCE_DISTRIBUTION || f.'source == SOURCE_CENTRAL
+        select f;
     return groupIntoSummaries(packageFindings);
 }
 
@@ -243,8 +257,22 @@ public function summarizeByPackage(model:CombinedReport report) returns PackageS
 // to Packages but keyed on the "vscode-extension" source and sub-grouped by scanned branch
 // instead of package version - see buildVersionGroups' "ballerina-vscode" branch.
 public function summarizeByPlugin(model:CombinedReport report) returns PackageSummary[] {
-    model:Finding[] pluginFindings = from var f in report.findings where f.'source == "vscode-extension" select f;
+    model:Finding[] pluginFindings = from var f in report.findings where f.'source == SOURCE_VSCODE select f;
     return groupIntoSummaries(pluginFindings);
+}
+
+// Ballerina Central bal TOOLS get their own top-level view, structurally identical to Packages
+// (same PackageSummary, same groupIntoSummaries, same PackageTable component in the React app) -
+// a tool is a package as far as this hierarchy is concerned: one row/issue, sub-grouped by
+// package version, CVEs nested under that (buildVersionGroups needs no special case for tools -
+// they carry package_version/ballerina_version exactly like a Central package, so they already
+// fall into its default branch). Kept as its own view purely because it's a separate pipeline
+// track end-to-end (see central_resolve.py/combine.py), so a tools-track scan failure or a
+// "already fixed as a tool, still pending as a package" divergence stays visible as its own
+// thing rather than being buried inside the Packages count.
+public function summarizeByTool(model:CombinedReport report) returns PackageSummary[] {
+    model:Finding[] toolFindings = from var f in report.findings where f.'source == SOURCE_TOOLS select f;
+    return groupIntoSummaries(toolFindings);
 }
 
 // "Accepted vulnerabilities in each Distribution" - the reference design doc's explicit ask for

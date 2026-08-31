@@ -36,7 +36,7 @@ public type Finding record {|
     // all (it's scanned by branch, see plugin_branch below), so this can't be required for
     // every finding the way it used to be when only distribution/central sources existed.
     string? ballerina_version;
-    string 'source; // "distribution" | "central" | "vscode-extension" - NEVER merge across these when aggregating
+    string 'source; // "distribution" | "central" | "tools" | "vscode-extension" - NEVER merge across these when aggregating
     string? package_org;
     string package_name; // always populated: "ballerina-lang"/"ballerina-vscode" for those sources, real name for central
     string? package_version;
@@ -46,6 +46,14 @@ public type Finding record {|
     // packages - kept as a separate field rather than overloading package_version because a
     // branch name isn't a version and conflating them would be misleading.
     string? plugin_branch = ();
+    // Only populated for source "tools": Ballerina Central's own `balToolId` (e.g. "scan" for
+    // the package ballerina/tool_scan) - deliberately NOT derivable from package_name (there is
+    // no naming convention at all: "tool_scan", "tool.persist", "wsdltool" all coexist), so it
+    // has to be carried explicitly from the registry's /registry/tools listing through
+    // central_resolve.py -> bala_scan.py -> combine.py. issue_sync.py titles a tool's issue with
+    // this alone - the module-{org}-{name} convention used for regular packages is confirmed
+    // actively misleading for tools (a tool's repo name bears no relation to its package name).
+    string? tool_id = ();
     // Raw underlying dependency coordinate trivy reports (e.g. "io.netty:netty-codec",
     // "axios"), independent of which Ballerina package/plugin wraps it. Version-independent, so
     // it's the only reliable way to check "is this library used by anything on Central at all" -

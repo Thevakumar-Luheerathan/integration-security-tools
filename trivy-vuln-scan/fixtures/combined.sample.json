@@ -7,6 +7,8 @@
     { "ballerina_version": "2201.13.x", "source": "central", "ok": true, "error": null },
     { "ballerina_version": "2201.12.x", "source": "distribution", "ok": true, "error": null },
     { "ballerina_version": "2201.12.x", "source": "central", "ok": false, "error": "resolve_package_for_line timed out for 4 packages after retries - see resolve-failures.json" },
+    { "ballerina_version": "2201.13.x", "source": "tools", "ok": true, "error": null },
+    { "ballerina_version": "2201.12.x", "source": "tools", "ok": true, "error": null },
     { "ballerina_version": null, "plugin_branch": "main", "source": "vscode-extension", "ok": true, "error": null }
   ],
   "findings": [
@@ -176,6 +178,54 @@
       "fixed_version": "1.12.500",
       "also_seen_in_jars": [],
       "issue": { "number": 5, "url": "https://github.com/Thevakumar-Luheerathan/integration-engineering/issues/5", "state": "closed", "created_at": "2026-07-01T00:00:00Z" }
+    },
+    {
+      "ballerina_version": "2201.13.x",
+      "source": "tools",
+      "package_org": "ballerina",
+      "package_name": "tool_scan",
+      "package_version": "0.11.0",
+      "tool_id": "scan",
+      "library_name": "org.apache.commons:commons-lang3",
+      "jar": "commons-lang3-3.17.0.jar",
+      "cve": "CVE-2025-48924",
+      "severity": "MEDIUM",
+      "installed_version": "3.17.0",
+      "fixed_version": "3.18.0",
+      "also_seen_in_jars": [],
+      "issue": null
+    },
+    {
+      "ballerina_version": "2201.12.x",
+      "source": "tools",
+      "package_org": "ballerina",
+      "package_name": "tool_scan",
+      "package_version": "0.10.0",
+      "tool_id": "scan",
+      "library_name": "org.apache.commons:commons-lang3",
+      "jar": "commons-lang3-3.16.0.jar",
+      "cve": "CVE-2025-48924",
+      "severity": "MEDIUM",
+      "installed_version": "3.16.0",
+      "fixed_version": "3.18.0",
+      "also_seen_in_jars": [],
+      "issue": null
+    },
+    {
+      "ballerina_version": "2201.13.x",
+      "source": "tools",
+      "package_org": "wso2",
+      "package_name": "tool_migrate_tibco",
+      "package_version": "1.2.14",
+      "tool_id": "migrate-tibco",
+      "library_name": "com.fasterxml.jackson.core:jackson-databind",
+      "jar": "jackson-databind-2.18.6.jar",
+      "cve": "CVE-2026-54512",
+      "severity": "HIGH",
+      "installed_version": "2.18.6",
+      "fixed_version": "2.18.8, 3.1.4, 2.21.4",
+      "also_seen_in_jars": [],
+      "issue": null
     },
     {
       "ballerina_version": null,

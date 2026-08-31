@@ -53,6 +53,8 @@ service / on new http:Listener(port) {
     // CVE hierarchy (see aggregate.bal:summarizeByPackage) that the React PackageTable renders.
     // byPlugin is the structurally-identical view for non-Ballerina-versioned sources (currently
     // just the ballerina-vscode extension, grouped by scanned branch instead of package version).
+    // byTool is the same structure again for Ballerina Central bal tools (its own pipeline track
+    // - see combine.py's process_central_tool_dir), kept separate from byPackage on purpose.
     resource function get api/summary() returns json|http:Response {
         CachedSnapshot|error snapshot = getSnapshotOrRefresh();
         if snapshot is error {
@@ -74,6 +76,7 @@ service / on new http:Listener(port) {
             byVersionAndSource: summarizeByVersionAndSource(snapshot.report).toJson(),
             byPackage: summarizeByPackage(snapshot.report).toJson(),
             byPlugin: summarizeByPlugin(snapshot.report).toJson(),
+            byTool: summarizeByTool(snapshot.report).toJson(),
             // "Accepted vulnerabilities in each Distribution" - per the reference design doc,
             // a per-line rollup distinct from the inline per-package/per-CVE display above.
             acceptedRiskByLine: summarizeAcceptedRiskByLine(snapshot.report).toJson(),
