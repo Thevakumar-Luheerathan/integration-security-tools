@@ -192,52 +192,174 @@ def fetch_issue_comment_bodies(tracking_repo, issue_number):
     return [c["body"] for c in json.loads(result).get("comments", [])]
 
 
-def known_cve_ids(tracking_repo, issue):
+def finding_scope(f):
     """
-    Every CVE already surfaced for this issue - from its body (only ever written at creation time
-    now, see render_body/create_issue) UNION every comment posted on it since (new-finding
-    comments from comment_new_findings, the close comment from close_issue, etc.).
+    The identity dimension a finding belongs to within its package - "which variant of this
+    package/version-line does this finding belong to". Reused by version_groups() (grouping) AND
+    known_finding_keys()/sync_package() (dedup identity) so the two can never drift apart: once a
+    package can resolve to multiple simultaneous versions (see the multi-version Central scan),
+    a bare CVE is no longer a unique identity - the same CVE can legitimately be new for one
+    version and already-known for another.
+    """
+    if f["package_name"] == "ballerina-lang":
+        return f["ballerina_version"]
+    if f["package_name"] == "ballerina-vscode":
+        return f["plugin_branch"]
+    return f["package_version"]
 
-    Needed because the body is no longer kept in sync after creation - it used to be the single
-    source of truth for "what's already been reported here", rewritten in full on every run. Now
-    that ongoing updates are comments instead, a CVE that only ever arrived via a comment (never
-    in the body) still has to count as "already known" - both for the open issue (so a routine
-    re-run doesn't re-comment about a finding that's still there) and for a CLOSED issue (so
-    suppress-on-recurrence in sync_package still recognizes it if the same CVE reappears later -
-    otherwise it would incorrectly look "new" and get its own fresh issue instead of being
-    suppressed as already-acknowledged).
+
+KEYS_MARKER_RE = re.compile(r"<!--\s*trivy-scan-keys:\s*(\{.*?\})\s*-->", re.DOTALL)
+
+
+def build_keys_marker(scope_to_cves):
     """
-    ids = extract_cve_ids(issue.get("body"))
+    Low-level marker builder taking a plain {scope: [cve, ...]} map - split out from
+    render_keys_marker so the standalone backfill script (which works from parsed GitHub text,
+    not Finding dicts) can build the identical marker format without duplicating this logic.
+    """
+    payload = {scope: sorted(set(cves)) for scope, cves in sorted(scope_to_cves.items())}
+    return f"<!-- trivy-scan-keys: {json.dumps(payload)} -->"
+
+
+def render_keys_marker(findings):
+    """
+    Hidden HTML-comment marker embedding a body/comment's exact (scope, cve) keys as structured
+    JSON - GitHub renders HTML comments as nothing visible, but `gh issue view --json
+    comments/body` returns the raw markdown source, so known_finding_keys can read this back out
+    exactly rather than re-deriving it from the visible table. Grouped by scope so a single
+    comment covering multiple versions at once doesn't collapse into an ambiguous flat CVE list.
+    """
+    by_scope = defaultdict(list)
+    for f in findings:
+        by_scope[finding_scope(f)].append(f["cve"])
+    return build_keys_marker(by_scope)
+
+
+def parse_keys_marker(text):
+    """Returns {(scope, cve), ...} from a trivy-scan-keys marker in text, or None if absent/unparseable."""
+    if not text:
+        return None
+    m = KEYS_MARKER_RE.search(text)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(1))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    keys = set()
+    for scope, cves in payload.items():
+        for cve in cves:
+            keys.add((scope, cve))
+    return keys
+
+
+def parse_body_scopes(text):
+    """
+    Fallback for bodies/comments that predate the trivy-scan-keys marker: recovers scope from
+    the "### <scope> (...)" section headers render_body already emits (see version_groups) -
+    scope is the text before " (" (a no-op split for distribution/vscode labels, which carry no
+    parenthetical). Returns {scope: set(cve)} by scanning each section's own text for CVE-shaped
+    tokens, so a CVE only ever attaches to the section it actually appeared under. Returns {} if
+    no "### " header is found at all (comments never have one - only render_body writes them).
+    """
+    if not text:
+        return {}
+    sections = re.split(r"^### (.+)$", text, flags=re.MULTILINE)
+    # re.split with a capturing group interleaves: [preamble, header1, body1, header2, body2, ...]
+    scopes = {}
+    for i in range(1, len(sections), 2):
+        header = sections[i]
+        section_text = sections[i + 1] if i + 1 < len(sections) else ""
+        scope = header.split(" (", 1)[0].strip()
+        scopes[scope] = extract_cve_ids(section_text)
+    return scopes
+
+
+def known_finding_keys(tracking_repo, issue):
+    """
+    Every (scope, cve) pair already surfaced for this issue - successor to the old CVE-only
+    known_cve_ids now that identity is scope-aware (see finding_scope): once a package can
+    resolve to multiple versions at once, a bare CVE match is no longer enough - a CVE already
+    reported for version 2.16.6 must not suppress that SAME CVE showing up for a different
+    version, 2.15.7, that was never actually reported.
+
+    Prefers the hidden trivy-scan-keys marker (present on every body/comment this script writes
+    going forward - see render_keys_marker) - exact, unambiguous. Falls back to parsing the
+    "### <scope> (...)" section headers already written by render_body, for older bodies/
+    comments that predate this change and carry no marker (verified: the 13 real open issues at
+    the time of this change each have exactly one such section, so their scope is unambiguous
+    even without a marker - see backfill_comment_versions.py for the one-off migration of their
+    comments). A comment with neither a marker nor a recognizable header contributes its bare
+    CVEs as known for EVERY scope this issue has otherwise established - conservative
+    (suppresses rather than double-posts) - and logs a warning naming the issue, so a missed
+    backfill is visible rather than silently wrong.
+    """
+    keys = set()
+    unscoped_cves = set()
+    all_scopes_seen = set()
+
+    def _consume(text):
+        marker_keys = parse_keys_marker(text)
+        if marker_keys is not None:
+            keys.update(marker_keys)
+            all_scopes_seen.update(scope for scope, _ in marker_keys)
+            return
+        scoped = parse_body_scopes(text)
+        if scoped:
+            for scope, cves in scoped.items():
+                all_scopes_seen.add(scope)
+                for cve in cves:
+                    keys.add((scope, cve))
+            return
+        bare = extract_cve_ids(text)
+        if bare:
+            unscoped_cves.update(bare)
+
+    _consume(issue.get("body"))
     for comment_body in fetch_issue_comment_bodies(tracking_repo, issue["number"]):
-        ids |= extract_cve_ids(comment_body)
-    return ids
+        _consume(comment_body)
+
+    if unscoped_cves:
+        print(
+            f"WARNING: issue #{issue['number']} has a comment/body with no trivy-scan-keys "
+            f"marker and no '### <scope>' header - treating {sorted(unscoped_cves)} as known "
+            f"for every scope this issue has ({sorted(all_scopes_seen) or 'none seen yet'}).",
+            file=sys.stderr,
+        )
+        for scope in all_scopes_seen:
+            for cve in unscoped_cves:
+                keys.add((scope, cve))
+
+    return keys
 
 
 def version_groups(package_name, findings):
     """
     Groups a package's findings into (label, findings) pairs per the package -> version -> CVE
     hierarchy - each version's CVE list belongs only to that version, never merged across
-    versions. Returns groups sorted by label for stable rendering.
+    versions. Returns groups sorted by label for stable rendering. Grouping key is finding_scope
+    (see there) so this can never drift out of sync with the dedup identity used elsewhere.
     """
     groups = defaultdict(list)
     if package_name == "ballerina-lang":
         for f in findings:
-            groups[f["ballerina_version"]].append(f)
+            groups[finding_scope(f)].append(f)
         return sorted(groups.items())
 
     if package_name == "ballerina-vscode":
         # No Ballerina version concept at all - grouped by the scanned branch instead.
         for f in findings:
-            groups[f["plugin_branch"]].append(f)
+            groups[finding_scope(f)].append(f)
         return sorted(groups.items())
 
     # Central package: group by distinct package_version, label with every Ballerina line that
-    # version was resolved for (a version can legitimately serve >1 line - Central always
-    # returns the single latest version, which often satisfies more than one line's floor check).
+    # version was resolved for (a version can legitimately serve >1 line - see the multi-version
+    # selection rule in central_resolve.py, which can also fill a line's slot from a lower one).
     versions_by_pkg_version = defaultdict(set)
     for f in findings:
-        groups[f["package_version"]].append(f)
-        versions_by_pkg_version[f["package_version"]].add(f["ballerina_version"])
+        scope = finding_scope(f)
+        groups[scope].append(f)
+        versions_by_pkg_version[scope].add(f["ballerina_version"])
 
     labeled = []
     for pkg_version, group_findings in groups.items():
@@ -246,11 +368,39 @@ def version_groups(package_name, findings):
     return sorted(labeled)
 
 
+def dedupe_for_display(findings):
+    """
+    Collapses Finding objects that share the same (scope, cve) into one representative, for
+    DISPLAY purposes only - never mutates or drops anything from combined.json itself. This
+    happens for real: a Central package version resolved under more than one configured line
+    (see central_resolve.py's multi-version selection) gets scanned once per line, and
+    combine.py's dedup is per-line (process_central_dir resets its "seen" map for each line's
+    own run) - so the exact same (package_version, cve) fact legitimately ends up as two
+    separate Finding objects, identical except for ballerina_version. Nothing distinguishes them
+    in a rendered row (which never shows ballerina_version - see render_finding_row/version_groups'
+    label, which already carries the "(2201.12.x, 2201.13.x)" line info at the header level), so
+    printing both is pure noise that reads as a data bug to anyone reading the issue.
+
+    Deliberately NOT done in combine.py / the Finding schema: dashboard-backend's
+    summarizeByVersionAndSource needs one Finding object per line to attribute severity counts
+    to each line correctly - collapsing at the data layer would silently under-count one line's
+    dashboard view. sync_package's issue-ref assignment also still iterates the full, undeduped
+    findings list, so every original object (including the one dropped here) still gets its
+    issue reference written back onto combined.json exactly as before.
+    """
+    seen = {}
+    for f in findings:
+        key = (finding_scope(f), f["cve"])
+        if key not in seen:
+            seen[key] = f
+    return list(seen.values())
+
+
 def render_finding_row(f):
     also = f.get("also_seen_in_jars") or []
     jar = f["jar"] + (f" (+{len(also)} more)" if also else "")
     fixed = f["fixed_version"] or "_no fix available yet_"
-    return f"| {jar} | {f['cve']} | {f['severity']} | {f['installed_version']} | {fixed} |"
+    return f"| {finding_scope(f)} | {jar} | {f['cve']} | {f['severity']} | {f['installed_version']} | {fixed} |"
 
 
 def render_body(package_org, package_name, findings, suppressed_count):
@@ -305,12 +455,13 @@ def render_body(package_org, package_name, findings, suppressed_count):
     for label, group_findings in version_groups(package_name, findings):
         lines.append(f"### {label}")
         lines.append("")
-        lines.append("| Jar | CVE | Severity | Installed | Fixed |")
-        lines.append("|---|---|---|---|---|")
-        for f in sorted(group_findings, key=lambda f: (f["severity"], f["cve"] or "")):
+        lines.append("| Version | Jar | CVE | Severity | Installed | Fixed |")
+        lines.append("|---|---|---|---|---|---|")
+        for f in sorted(dedupe_for_display(group_findings), key=lambda f: (f["severity"], f["cve"] or "")):
             lines.append(render_finding_row(f))
         lines.append("")
 
+    lines.append(render_keys_marker(findings))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -335,10 +486,11 @@ def create_issue(tracking_repo, package_org, package_name, active_findings, dry_
 
 
 def render_new_findings_comment(new_findings, suppressed_count):
-    lines = [f"**{len(new_findings)} new finding(s) detected in this scan:**", ""]
-    lines.append("| Jar | CVE | Severity | Installed | Fixed |")
-    lines.append("|---|---|---|---|---|")
-    for f in sorted(new_findings, key=lambda f: (f["severity"], f["cve"] or "")):
+    display_findings = dedupe_for_display(new_findings)
+    lines = [f"**{len(display_findings)} new finding(s) detected in this scan:**", ""]
+    lines.append("| Version | Jar | CVE | Severity | Installed | Fixed |")
+    lines.append("|---|---|---|---|---|---|")
+    for f in sorted(display_findings, key=lambda f: (f["severity"], f["cve"] or "")):
         lines.append(render_finding_row(f))
     if suppressed_count:
         lines.append("")
@@ -346,6 +498,8 @@ def render_new_findings_comment(new_findings, suppressed_count):
             f"_{suppressed_count} other finding(s) for this package matched a CVE already "
             f"covered by a previously closed issue and are intentionally omitted._"
         )
+    lines.append("")
+    lines.append(render_keys_marker(new_findings))
     return "\n".join(lines)
 
 
@@ -396,29 +550,34 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run, pa
     title = issue_title(package_org, package_name)
     open_issue, closed_issues = find_package_issues(tracking_repo, title)
 
-    # Union of CVEs already covered by ANY closed issue for this package, plus a per-CVE map to
-    # the most recent closed issue that mentioned it (for attaching a reference onto suppressed
-    # findings below). known_cve_ids (not extract_cve_ids(body) alone) is required here: a CVE
-    # may have only ever been surfaced via a comment on this issue while it was still open (see
-    # comment_new_findings), never written into the body itself - missing that would make a
-    # recurring CVE look "new" instead of being correctly suppressed as already-acknowledged.
-    closed_cve_to_issue = {}
-    for issue in sorted(closed_issues, key=lambda i: i["updatedAt"]):
-        for cve in known_cve_ids(tracking_repo, issue):
-            closed_cve_to_issue[cve] = issue  # later (more recent) closed issues win on conflict
-    closed_cves = set(closed_cve_to_issue.keys())
+    def finding_key(f):
+        return (finding_scope(f), f["cve"])
 
-    active = [f for f in findings if f["cve"] not in closed_cves]
-    suppressed = [f for f in findings if f["cve"] in closed_cves]
+    # Union of (scope, cve) keys already covered by ANY closed issue for this package, plus a
+    # per-key map to the most recent closed issue that mentioned it (for attaching a reference
+    # onto suppressed findings below). known_finding_keys (not extract_cve_ids(body) alone) is
+    # required here: a key may have only ever been surfaced via a comment on this issue while it
+    # was still open (see comment_new_findings), never written into the body itself - missing
+    # that would make a recurring finding look "new" instead of being correctly suppressed as
+    # already-acknowledged. Scope-aware (not CVE-only) so a CVE already acknowledged for one
+    # version doesn't wrongly suppress the SAME CVE newly appearing on a different version.
+    closed_key_to_issue = {}
+    for issue in sorted(closed_issues, key=lambda i: i["updatedAt"]):
+        for key in known_finding_keys(tracking_repo, issue):
+            closed_key_to_issue[key] = issue  # later (more recent) closed issues win on conflict
+    closed_keys = set(closed_key_to_issue.keys())
+
+    active = [f for f in findings if finding_key(f) not in closed_keys]
+    suppressed = [f for f in findings if finding_key(f) in closed_keys]
 
     issue_refs = {}
 
     if active:
         if open_issue:
-            already_known = known_cve_ids(tracking_repo, open_issue)
-            new_findings = [f for f in active if f["cve"] not in already_known]
+            already_known = known_finding_keys(tracking_repo, open_issue)
+            new_findings = [f for f in active if finding_key(f) not in already_known]
             if new_findings:
-                ref = comment_new_findings(tracking_repo, open_issue, new_findings, len(suppressed), dry_run)
+                ref = comment_new_findings(tracking_repo, open_issue, new_findings, len(dedupe_for_display(suppressed)), dry_run)
             else:
                 ref = issue_ref(open_issue)
         else:
@@ -430,7 +589,7 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run, pa
         close_issue(tracking_repo, open_issue, dry_run)
 
     for f in suppressed:
-        closed_issue = closed_cve_to_issue[f["cve"]]
+        closed_issue = closed_key_to_issue[finding_key(f)]
         issue_refs[id(f)] = {
             "number": closed_issue["number"], "url": closed_issue["url"], "state": "closed",
             "created_at": closed_issue.get("createdAt"),

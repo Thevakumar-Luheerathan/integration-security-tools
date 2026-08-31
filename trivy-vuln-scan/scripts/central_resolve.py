@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Resolve the set of Ballerina Central Java-platform packages compatible with a given
+Resolve the set of Ballerina Central Java-platform package VERSIONS compatible with a given
 Ballerina distribution release line (e.g. "2201.12.x").
 
 Background (verified during design, see the repo's vuln-scan plan for full evidence):
@@ -21,13 +21,28 @@ Background (verified during design, see the repo's vuln-scan plan for full evide
     package whose latest version is "any" but had an older java21 version is invisible to this
     approach. This is a known, documented approximation - see the plan's "Known gaps" section.
 
+Selection rule (confirmed with user, replaces the old "newest compatible version only" behavior):
+  Order the configured distributions descending. Under each, place the library versions built
+  FOR that distribution. A distribution left empty for a given library is filled from the most
+  recent distribution that DOES have versions for it. Then keep only the latest patch of each
+  (major, minor) combination - applied uniformly, not differently per case.
+
+  As an algorithm, per target line D: consider only versions with floor <= D; let F be the
+  highest floor present in that set; take every version whose floor == F (the "F run" - versions
+  are newest-first and, under the monotonicity assumption above, same-floor versions are
+  contiguous); reduce to the latest patch of each (major, minor). See _resolve_version_pool.
+
+  Pre-GA ballerinaVersion labels are real in production (observed: "slalpha5", "slbeta2",
+  "slbeta3", "slbeta6" on ballerinax/choreo, ballerinax/azure_cosmosdb, ballerinax/trigger.asb) -
+  version_to_tuple sentinels these below every real 2201.x floor explicitly (see its docstring).
+
 Output: a JSON array of objects:
   {"org": ..., "name": ..., "version": ..., "ballerinaVersion": ..., "platform": ...,
    "balaURL": ..., "digest": ...}
-one entry per package that has a version compatible with the target line (the newest such
-version). Also writes a small sidecar of packages that could NOT be resolved (network errors,
-monotonicity anomalies needing a fallback that also failed) so failures are visible instead of
-silently dropped.
+one entry per SELECTED version - a package can now contribute more than one entry per line (see
+the selection rule above). Also writes a small sidecar of packages that could NOT be resolved
+(network errors, monotonicity anomalies needing a fallback that also failed) so failures are
+visible instead of silently dropped.
 """
 import argparse
 import concurrent.futures
@@ -95,8 +110,20 @@ def line_to_tuple(line):
 
 
 def version_to_tuple(v):
-    """'2201.12.0' -> (2201, 12, 0). Tolerates missing patch component."""
+    """
+    '2201.12.0' -> (2201, 12, 0). Tolerates missing patch component.
+
+    Pre-GA labels are real in production ballerinaVersion values (observed: "slalpha5",
+    "slbeta2", "slbeta3", "slbeta6" on ballerinax/choreo, ballerinax/azure_cosmosdb,
+    ballerinax/trigger.asb) - never a real distribution version. Explicitly sentinel these to
+    sort below every real 2201.x floor: the first dot-separated part must be ALL digits for this
+    to parse as a genuine version, otherwise return (-1, 0, 0). This used to happen only by
+    accident (digit-stripping "slbeta6" silently yielded (6, 0, 0), which happened to still sort
+    below 2201.x, but would silently misbehave for a label like "slbeta2201").
+    """
     parts = v.split(".")
+    if not parts or not parts[0].isdigit():
+        return (-1, 0, 0)
     nums = []
     for p in parts:
         digits = "".join(ch for ch in p if ch.isdigit())
@@ -126,9 +153,10 @@ def list_candidate_packages(orgs, platforms):
 
 def resolve_package_for_line(org, name, target_tuple, platforms):
     """
-    Find the newest version of org/name whose ballerinaVersion floor is <= target_tuple's
-    (major, minor). Tries each platform's header (a package may only exist under one).
-    Returns a resolved dict, or None if no compatible version exists on any platform.
+    Resolve every version of org/name selected for target_tuple's line, per the module
+    docstring's selection rule. Tries each platform's header (a package may only exist under
+    one). Returns a list of resolved dicts - empty if no compatible version exists on any
+    platform.
     """
     for platform in platforms:
         headers = {"Ballerina-Platform": platform}
@@ -139,10 +167,10 @@ def resolve_package_for_line(org, name, target_tuple, platforms):
         if not versions:
             continue
         # Registry returns newest-first.
-        result = _binary_search_compatible(org, name, versions, target_tuple, headers)
-        if result is not None:
+        result = _resolve_version_pool(org, name, versions, target_tuple, headers)
+        if result:
             return result
-    return None
+    return []
 
 
 def _fetch_version_meta(org, name, version, headers):
@@ -162,44 +190,69 @@ def _fetch_version_meta(org, name, version, headers):
     }
 
 
-def _binary_search_compatible(org, name, versions, target_tuple, headers):
+def _floor_of(meta):
+    return meta["ballerinaVersionTuple"][:2]
+
+
+def _reduce_to_latest_patch(pool):
     """
-    versions: newest-first list of version strings.
-    Binary-searches for the newest version whose ballerinaVersion (major, minor) <= target.
-    Falls back to a linear scan if the monotonicity assumption appears violated.
+    Groups a pool of resolved version metas by (major, minor) parsed from the package's OWN
+    version string (not ballerinaVersion - that's the floor already used to build the pool),
+    keeping only the newest patch of each - the final cut in the selection rule, applied
+    identically whether the pool came from a directly-matched configured line or a lower-floor
+    fallback.
+    """
+    best_by_minor = {}
+    for meta in pool:
+        major_minor = version_to_tuple(meta["version"])[:2]
+        existing = best_by_minor.get(major_minor)
+        if existing is None or version_to_tuple(meta["version"]) > version_to_tuple(existing["version"]):
+            best_by_minor[major_minor] = meta
+    return list(best_by_minor.values())
+
+
+def _resolve_version_pool(org, name, versions, target_tuple, headers):
+    """
+    versions: newest-first list of version strings for one platform.
+
+    Binary-searches for the newest version whose ballerinaVersion (major, minor) <= target -
+    this newest-qualifying version's floor IS the F in the module docstring's selection rule
+    (the highest floor <= target present in this package's history), since versions[] is
+    newest-first and floor is assumed monotonic. Then walks forward (older) from it collecting
+    every version that shares that exact floor (the contiguous "F run"), and reduces the pool to
+    the latest patch of each (major, minor).
+
+    Falls back to a full linear scan if the monotonicity assumption is observed to break for
+    this package. Returns [] if nothing qualifies.
     """
     lo, hi = 0, len(versions) - 1
     best = None
-    probes = 0
+    best_index = None
     monotonicity_violated = False
-    last_seen = None  # (index, ballerinaVersionTuple) most recently fetched, for a sanity check
+    last_seen = None  # (index, floor) most recently fetched, for a sanity check
 
     while lo <= hi:
         mid = (lo + hi) // 2
         meta = _fetch_version_meta(org, name, versions[mid], headers)
-        probes += 1
         if meta is None or meta["ballerinaVersionTuple"] is None:
             hi = mid - 1
             continue
-        bv = meta["ballerinaVersionTuple"][:2]  # compare on (major, minor) only
+        bv = _floor_of(meta)
 
         if last_seen is not None:
             prev_idx, prev_bv = last_seen
             # versions[] is newest-first: a SMALLER index is a newer package version and
-            # should have a >= ballerinaVersion. If a newer version has a strictly OLDER
-            # ballerinaVersion than a version we saw that was older-in-index, monotonicity
-            # (as verified for ballerina/http) does not hold for this package.
+            # should have a >= floor. If a newer version has a strictly OLDER floor than a
+            # version we saw that was older-in-index, monotonicity does not hold for this
+            # package (verified to hold for ballerina/http, not exhaustively for every package).
             if (mid < prev_idx and bv < prev_bv) or (mid > prev_idx and bv > prev_bv):
                 monotonicity_violated = True
         last_seen = (mid, bv)
 
         if bv <= target_tuple:
-            # This version is old enough to qualify. versions[] is newest-first (index 0 =
-            # newest), so try smaller indices to find an even newer qualifying version.
-            best = meta
+            best, best_index = meta, mid
             hi = mid - 1
         else:
-            # Too new for the target line - look toward older versions (larger index).
             lo = mid + 1
 
     if monotonicity_violated:
@@ -208,20 +261,45 @@ def _binary_search_compatible(org, name, versions, target_tuple, headers):
             f"falling back to a full linear scan ({len(versions)} versions).",
             file=sys.stderr,
         )
-        return _linear_scan_compatible(org, name, versions, target_tuple, headers)
+        return _linear_scan_pool(org, name, versions, target_tuple, headers)
 
-    return best
+    if best is None:
+        return []
+
+    floor = _floor_of(best)
+    pool = [best]
+    idx = best_index + 1
+    while idx < len(versions):
+        meta = _fetch_version_meta(org, name, versions[idx], headers)
+        if meta is None or meta["ballerinaVersionTuple"] is None:
+            idx += 1
+            continue
+        if _floor_of(meta) != floor:
+            break
+        pool.append(meta)
+        idx += 1
+
+    return _reduce_to_latest_patch(pool)
 
 
-def _linear_scan_compatible(org, name, versions, target_tuple, headers):
-    """Exhaustive fallback: newest-first, return the first version that's compatible."""
+def _linear_scan_pool(org, name, versions, target_tuple, headers):
+    """
+    Exhaustive fallback when monotonicity doesn't hold for this package: fetches every version's
+    metadata, finds the true highest floor <= target_tuple (F) among them, collects every
+    version sharing that floor, and reduces as usual.
+    """
+    metas = []
     for v in versions:
         meta = _fetch_version_meta(org, name, v, headers)
         if meta is None or meta["ballerinaVersionTuple"] is None:
             continue
-        if meta["ballerinaVersionTuple"][:2] <= target_tuple:
-            return meta
-    return None
+        if _floor_of(meta) <= target_tuple:
+            metas.append(meta)
+    if not metas:
+        return []
+    floor = max(_floor_of(m) for m in metas)
+    pool = [m for m in metas if _floor_of(m) == floor]
+    return _reduce_to_latest_patch(pool)
 
 
 def main():
@@ -257,7 +335,7 @@ def main():
         for org, name, result, err in pool.map(_work, candidates):
             if err is not None:
                 failures.append({"org": org, "name": name, "error": err})
-            elif result is None:
+            elif not result:
                 # No version of this package targets this line or anything older - not a
                 # failure, just not applicable (e.g. package launched after this line's date).
                 continue
@@ -265,11 +343,12 @@ def main():
                 # Stamp when this package's balaURL was actually fetched, so a downstream
                 # consumer (bala_scan.py) knows whether it's stale (URLs expire ~5min after
                 # the metadata call that produced them) without re-deriving it from file mtimes.
-                result["resolved_at"] = time.time()
-                resolved.append(result)
+                for r in result:
+                    r["resolved_at"] = time.time()
+                    resolved.append(r)
 
     print(
-        f"Resolved {len(resolved)} packages for line {args.line}; "
+        f"Resolved {len(resolved)} version(s) for line {args.line}; "
         f"{len(failures)} failures.",
         file=sys.stderr,
     )
