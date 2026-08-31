@@ -23,9 +23,9 @@ Inputs, per configured version line:
   --dist-trivyignore <line>=<path>      ballerina-distribution's OWN per-branch .trivyignore for
                                          that line (fetched from the real, actively-maintained
                                          file in ballerina-platform/ballerina-distribution@<line>).
-                                         Applied to BOTH distribution and central findings for
-                                         that line - one shared accepted-risk list per line, not
-                                         per-package (see module docstring below on why). Repeatable.
+                                         Applied ONLY to distribution findings for that line -
+                                         Central findings no longer consult this file at all (see
+                                         "Central accepted-risk handling" below). Repeatable.
   --vscode-trivyignore <branch>=<path>  ballerina-vscode's own .trivyignore file(s) for that
                                          branch (the fs scan's repo+submodule files, the ls scan's
                                          language-server one) - merged per branch. Repeatable.
@@ -39,6 +39,17 @@ documented, not something to hide. Trivy's own `--ignorefile`/`--show-suppressed
 for this (verified: `--show-suppressed` does not actually restore suppressed entries to JSON
 output in the installed trivy version) - every scan runs with no ignorefile at all, and this
 script does the suppression/classification itself in one place for every source.
+
+Central accepted-risk handling (per-package, NOT the shared distribution file): Central findings
+check ONLY their own package's repo .trivyignore (see load_package_trivyignore), fetched live
+from that repo's default branch using the `repo` field central_resolve.py/bala_scan.py attach to
+each manifest entry. This replaced an earlier design where Central findings shared
+ballerina-distribution's file with distribution findings - that was both indiscriminate (one CVE
+excluded for a line suppressed it for every package on that line) and line-scoped rather than
+version-scoped (once a package's same version could be resolved under multiple lines, an
+exclusion added to only one line's branch left it active under the other). A package with no
+resolved repo, or whose repo has no .trivyignore, simply gets no accepted_risk tag for that CVE -
+there is NO fallback to ballerina-distribution's file for Central findings anymore.
 
 Package identity is (package_org, package_name) - "ballerina-lang" (package_org=None) for
 distribution-source findings, or the actual Central org/name (e.g. "ballerinax"/"redis") for
@@ -65,10 +76,33 @@ still pending in the distribution" signal, which a cross-source merge would dest
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
 DISTRIBUTION_PACKAGE_NAME = "ballerina-lang"
+
+
+def _fetch_raw_github(url):
+    """
+    Fetch a raw file from GitHub, returning its text content, or None on 404/any failure. Same
+    minimal, no-retry shape as central_resolve.py's own helper of the same name (this script has
+    no prior curl dependency of its own, deliberately not sharing a module with central_resolve.py
+    across these standalone scripts - matches this codebase's existing convention of small
+    per-script duplication, e.g. bala_scan.py/central_resolve.py each already have their own
+    near-identical curl helpers rather than a shared one).
+    """
+    cmd = ["curl", "-sS", "-L", "--max-time", "15", "-w", "\n%{http_code}", url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode != 0:
+        return None
+    body, _, status = proc.stdout.rpartition("\n")
+    if status.strip().startswith("2"):
+        return body
+    return None
 
 
 def parse_trivy_report(path):
@@ -133,6 +167,47 @@ def load_merged_trivyignore(paths):
     for path in paths or []:
         merged.update(load_trivyignore(path))
     return merged
+
+
+# Cached per repo within this run - central_resolve.py's multi-version selection can produce many
+# manifest entries sharing one repo (e.g. ballerina/ai resolves to 15 versions in real production
+# data), and a repo's .trivyignore doesn't vary by package version - re-fetching it per version
+# would be wasteful.
+_PACKAGE_TRIVYIGNORE_CACHE = {}
+
+
+def _repo_raw_url(repo, branch, path):
+    """'https://github.com/{owner}/{name}' -> 'https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}'"""
+    owner_repo = repo.rstrip("/")
+    if owner_repo.startswith("https://github.com/"):
+        owner_repo = owner_repo[len("https://github.com/"):]
+    return f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{path}"
+
+
+def load_package_trivyignore(repo):
+    """
+    Fetches <repo>@<default branch>/.trivyignore for a Central package's own repo (see
+    central_resolve.py's resolve_package_repo) - the per-package replacement for the old shared
+    ballerina-distribution ignorefile (see module docstring's "Central accepted-risk handling").
+    Tries master then main (every real module repo checked during design uses master, but that's
+    not asserted to hold for every repo Central might ever resolve to - e.g. wso2/xlibb-hosted
+    repos). Returns ({}, None) if repo is falsy, or if neither branch has a .trivyignore -
+    correctly means "no accepted-risk tags for this package", not a fallback to any other file.
+    """
+    if not repo:
+        return {}, None
+    if repo in _PACKAGE_TRIVYIGNORE_CACHE:
+        return _PACKAGE_TRIVYIGNORE_CACHE[repo]
+
+    result = ({}, None)
+    for branch in ("master", "main"):
+        text = _fetch_raw_github(_repo_raw_url(repo, branch, ".trivyignore"))
+        if text is not None:
+            result = (parse_trivyignore(text), f"{repo}:.trivyignore@{branch}")
+            break
+
+    _PACKAGE_TRIVYIGNORE_CACHE[repo] = result
+    return result
 
 
 def dedupe_within_source(raw_findings, dedupe_key_fn):
@@ -218,7 +293,12 @@ def process_vscode_report(branch, report_paths, ignore_map, ignore_source, findi
     findings_out.extend(deduped)
 
 
-def process_central_dir(line, central_dir, ignore_map, ignore_source, findings_out):
+def process_central_dir(line, central_dir, findings_out):
+    """
+    Unlike process_distribution_report/process_vscode_report, this does NOT take a shared
+    ignore_map/ignore_source - each package resolves its OWN accepted-risk map from its own repo
+    (see load_package_trivyignore), per the module docstring's "Central accepted-risk handling".
+    """
     manifest_path = os.path.join(central_dir, "manifest.json")
     with open(manifest_path) as f:
         manifest = json.load(f)
@@ -227,6 +307,7 @@ def process_central_dir(line, central_dir, ignore_map, ignore_source, findings_o
         report_path = os.path.join(central_dir, pkg["report"])
         if not os.path.exists(report_path):
             continue
+        ignore_map, ignore_source = load_package_trivyignore(pkg.get("repo"))
         raw = []
         for target, cve, severity, trivy_pkg_name, installed, fixed in parse_trivy_report(report_path):
             jar = os.path.basename(target)
@@ -308,8 +389,9 @@ def main():
     versions = sorted(set(list(dist_reports) + list(central_dirs)))
 
     for line in versions:
-        # Same shared per-line ballerina-distribution file for BOTH distribution and central
-        # findings on this line - confirmed design, not a per-package/per-source ignorefile.
+        # ballerina-distribution's file - distribution findings ONLY. Central findings resolve
+        # their own per-package ignorefile inside process_central_dir instead (see module
+        # docstring's "Central accepted-risk handling").
         line_ignore_map = load_trivyignore(dist_trivyignore_paths.get(line))
         line_ignore_source = f"ballerina-distribution:.trivyignore@{line}"
 
@@ -334,7 +416,7 @@ def main():
 
         if line in central_dirs:
             try:
-                process_central_dir(line, central_dirs[line], line_ignore_map, line_ignore_source, findings)
+                process_central_dir(line, central_dirs[line], findings)
                 ok = central_status.get(line, "ok") == "ok"
                 scan_status.append({
                     "ballerina_version": line, "source": "central",

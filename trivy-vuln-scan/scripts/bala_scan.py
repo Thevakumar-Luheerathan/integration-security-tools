@@ -3,7 +3,8 @@
 Download a set of resolved Ballerina Central packages (.bala files) and trivy-scan each one.
 
 Input: the JSON produced by central_resolve.py - a list of
-  {"org", "name", "version", "ballerinaVersion", "platform", "balaURL", "digest", "resolved_at"}
+  {"org", "name", "version", "ballerinaVersion", "platform", "balaURL", "digest", "resolved_at",
+   "repo"}
 
 A .bala is just a zip archive that bundles every third-party JAR the package ships (verified
 during design by extracting a real one - platform/java21/*.jar plus compiler-plugin/libs/*.jar).
@@ -15,8 +16,8 @@ than a few minutes old by the time we get to a given package (e.g. we're deep in
 sequential run), we re-fetch that package's metadata to get a fresh URL rather than risk a 403.
 
 Output: for each package, a trivy JSON report at <out-dir>/<org>__<name>__<version>.trivy.json,
-plus a manifest.json mapping report files back to package metadata (org/name/version/ballerinaVersion)
-so combine.py doesn't have to re-derive it from the filename.
+plus a manifest.json mapping report files back to package metadata (org/name/version/
+ballerinaVersion/repo) so combine.py doesn't have to re-derive it from the filename.
 """
 import argparse
 import concurrent.futures
@@ -123,12 +124,18 @@ def main():
             return {
                 "org": pkg["org"], "name": pkg["name"], "version": pkg["version"],
                 "ballerinaVersion": pkg["ballerinaVersion"], "report": os.path.basename(report_path),
-                "error": None,
+                # Passed through from central_resolve.py's output - combine.py uses this to read
+                # the package's OWN .trivyignore instead of the shared distribution-wide one.
+                # Must be explicitly carried here: this dict is built fresh, not a copy of `pkg`,
+                # so any field not named here (this one included, before this fix) is silently
+                # dropped before combine.py ever sees it.
+                "repo": pkg.get("repo"), "error": None,
             }
         except Exception as e:  # noqa: BLE001 - record and continue; one bad package shouldn't kill the run
             return {
                 "org": pkg["org"], "name": pkg["name"], "version": pkg["version"],
-                "ballerinaVersion": pkg.get("ballerinaVersion"), "report": None, "error": str(e),
+                "ballerinaVersion": pkg.get("ballerinaVersion"), "repo": pkg.get("repo"),
+                "report": None, "error": str(e),
             }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
