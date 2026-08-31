@@ -103,16 +103,16 @@ function testSummarizeByPackageGroupsOnePackageAcrossVersionLines() returns erro
 }
 
 @test:Config {}
-function testSummarizeByPackageGroupsBallerinaLangByLineNotByJar() returns error? {
+function testSummarizeByLanguageCoreGroupsBallerinaLangByLineNotByJar() returns error? {
     model:CombinedReport report = check loadFixture();
-    PackageSummary[] packages = summarizeByPackage(report);
+    PackageSummary[] core = summarizeByLanguageCore(report);
 
     // ballerina-lang (package_org == ()) has findings on both 2201.12.x (commons-beanutils) and
-    // 2201.13.x (netty-codec-http, jackson-databind) - still exactly ONE package entry, and for
+    // 2201.13.x (netty-codec-http, jackson-databind) - still exactly ONE entry, and for
     // ballerina-lang specifically each Ballerina line is its own VersionGroup (no package_version
     // concept there).
-    PackageSummary? lang = findPackage(packages, (), "ballerina-lang");
-    test:assertTrue(lang is PackageSummary, msg = "expected exactly one ballerina-lang package entry");
+    PackageSummary? lang = findPackage(core, (), "ballerina-lang");
+    test:assertTrue(lang is PackageSummary, msg = "expected exactly one ballerina-lang Language Core entry");
     PackageSummary langPkg = <PackageSummary>lang;
     test:assertEquals(langPkg.versions.length(), 2, msg = "expected one VersionGroup per Ballerina line (2201.12.x, 2201.13.x)");
 
@@ -140,8 +140,9 @@ function testSummarizeByPackageNeverProducesAnUnresolvedBucket() returns error? 
 
     // There is no repo-resolution step left to fail (confirmed design decision) - every finding
     // has a real package_org/package_name by construction, so no package summary should ever
-    // need an "(unresolved)" placeholder the way the old repo-keyed view did.
-    test:assertEquals(packages.length(), 5, msg = "expected exactly 5 distinct packages in the fixture");
+    // need an "(unresolved)" placeholder the way the old repo-keyed view did. 4, not 5: ballerina
+    // -lang now belongs exclusively to Language Core (see summarizeByLanguageCore), not Packages.
+    test:assertEquals(packages.length(), 4, msg = "expected exactly 4 distinct Central packages in the fixture");
     foreach var p in packages {
         test:assertTrue(p.package_name.length() > 0, msg = "package_name must never be empty/placeholder");
         test:assertFalse(p.package_name == "(unresolved)");
@@ -159,17 +160,19 @@ function testSummarizeByPackageExcludesVscodeExtension() returns error? {
     model:CombinedReport report = check loadFixture();
     PackageSummary[] packages = summarizeByPackage(report);
 
-    // The fixture's 2 vscode-extension findings must never appear in the Packages view - they
-    // belong exclusively to summarizeByPlugin (see below). Package count stays at 5 regardless
-    // of the vscode-extension findings added to the fixture. This is now the allowlist fix's real
-    // regression guard too: summarizeByPackage used to be `!= "vscode-extension"`, which would
-    // have silently swept the fixture's 3 "tools" findings in here as well (count would be 7,
-    // not 5) - see testEverySourceBelongsToExactlyOneView below for the general form of this check.
-    test:assertEquals(packages.length(), 5);
+    // Packages is now an explicit allowlist of exactly "central" (see summarizeByPackage) - none
+    // of vscode-extension, tools, or distribution (ballerina-lang) may appear here. Count stays
+    // at 4 regardless of how many other-source findings the fixture carries - this is the
+    // allowlist fix's real regression guard (a plain negative filter would have silently swept
+    // "tools" in here, and previously did also include ballerina-lang) - see
+    // testEverySourceBelongsToExactlyOneView below for the general form of this check.
+    test:assertEquals(packages.length(), 4);
     PackageSummary? vscode = findPackage(packages, (), "ballerina-vscode");
     test:assertTrue(vscode is (), msg = "ballerina-vscode must not appear in the Packages view");
     PackageSummary? tool = findPackage(packages, "ballerina", "tool_scan");
     test:assertTrue(tool is (), msg = "a \"tools\"-source finding must not appear in the Packages view");
+    PackageSummary? lang = findPackage(packages, (), "ballerina-lang");
+    test:assertTrue(lang is (), msg = "ballerina-lang must not appear in the Packages view - it belongs to Language Core");
 }
 
 @test:Config {}
@@ -203,12 +206,12 @@ function testSummarizeByPluginGroupsByBranchNotVersion() returns error? {
 @test:Config {}
 function testAcceptedRiskFindingsAreNeverDroppedFromTheTree() returns error? {
     model:CombinedReport report = check loadFixture();
-    PackageSummary[] packages = summarizeByPackage(report);
+    PackageSummary[] core = summarizeByLanguageCore(report);
 
     // ballerina-lang's fixture accepted-risk finding (CVE-2025-48924, .trivyignore@2201.13.x)
     // must still be present in its VersionGroup, carrying its accepted_risk reason verbatim -
     // never dropped just because it's not an active/tracked finding.
-    PackageSummary? lang = findPackage(packages, (), "ballerina-lang");
+    PackageSummary? lang = findPackage(core, (), "ballerina-lang");
     test:assertTrue(lang is PackageSummary);
     PackageSummary langPkg = <PackageSummary>lang;
 
@@ -337,11 +340,14 @@ function testSummarizeByToolGroupsByPackageVersionLikeACentralPackage() returns 
 @test:Config {}
 function testEverySourceBelongsToExactlyOneView() returns error? {
     // The general form of the allowlist-fix regression guard: whatever distinct `source` values
-    // exist in the fixture, each one's findings must appear in EXACTLY one of the three views -
+    // exist in the fixture, each one's findings must appear in EXACTLY one of the four views -
     // never zero (silently dropped) and never two (double-counted). This is what makes adding a
     // future fifth source safe: this test fails loudly instead of a source silently landing in
-    // the wrong tab, the way "tools" would have under the old `!= "vscode-extension"` filter.
+    // the wrong tab, the way "tools" would have under the old `!= "vscode-extension"` filter,
+    // and the way "distribution" used to double up with "central" in Packages before the
+    // Language Core split.
     model:CombinedReport report = check loadFixture();
+    PackageSummary[] core = summarizeByLanguageCore(report);
     PackageSummary[] packages = summarizeByPackage(report);
     PackageSummary[] plugins = summarizeByPlugin(report);
     PackageSummary[] tools = summarizeByTool(report);
@@ -352,9 +358,9 @@ function testEverySourceBelongsToExactlyOneView() returns error? {
             sources.push(f.'source);
         }
     }
-    test:assertTrue(sources.length() >= 3, msg = "fixture should exercise at least distribution/central/tools/vscode-extension");
+    test:assertTrue(sources.length() >= 4, msg = "fixture should exercise all of distribution/central/tools/vscode-extension");
 
-    PackageSummary[][] views = [packages, plugins, tools];
+    PackageSummary[][] views = [core, packages, plugins, tools];
     foreach var 'source in sources {
         int count = 0;
         foreach var view in views {

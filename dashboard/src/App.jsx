@@ -13,14 +13,16 @@ function displayName(user) {
 }
 
 // Tab list is data-driven rather than a ternary so adding a source is one entry, not a branch.
-// Each entry maps 1:1 onto a dashboard-backend /api/summary field, all three of which are the
+// Each entry maps 1:1 onto a dashboard-backend /api/summary field, all four of which are the
 // SAME PackageSummary[] shape (see aggregate.bal) - so one PackageTable renders all of them: a
-// plugin and a tool are each structurally a package, one row sub-grouped by build variant with
-// CVEs nested under that.
+// core language finding, a package, a tool, and a plugin are each structurally the same thing,
+// one row sub-grouped by build variant with CVEs nested under that. Order here is the order the
+// tabs render in, left to right.
 const TABS = [
+  {key: "language-core", label: "Language Core", dataKey: "byLanguageCore"},
   {key: "packages", label: "Packages", dataKey: "byPackage"},
-  {key: "plugins", label: "Plugins", dataKey: "byPlugin"},
   {key: "tools", label: "Tools", dataKey: "byTool"},
+  {key: "plugins", label: "Plugins", dataKey: "byPlugin"},
 ];
 
 function formatTimestamp(iso) {

@@ -49,12 +49,13 @@ function decimalSecondsBetween(string isoA, string isoB) returns decimal|error {
 service / on new http:Listener(port) {
 
     // The dashboard UI itself is the separate React app (a Choreo Web Application component) -
-    // this service is a pure JSON API. byPackage groups findings into the package -> version ->
-    // CVE hierarchy (see aggregate.bal:summarizeByPackage) that the React PackageTable renders.
-    // byPlugin is the structurally-identical view for non-Ballerina-versioned sources (currently
-    // just the ballerina-vscode extension, grouped by scanned branch instead of package version).
-    // byTool is the same structure again for Ballerina Central bal tools (its own pipeline track
-    // - see combine.py's process_central_tool_dir), kept separate from byPackage on purpose.
+    // this service is a pure JSON API. Four structurally-identical views, each keyed to its own
+    // pipeline source so nothing is ever double-counted (see aggregate.bal's SOURCE_* constants):
+    // byLanguageCore is what ships with ballerina-lang itself (source "distribution"); byPackage
+    // is Central packages/connectors (source "central"); byTool is Central bal tools, its own
+    // pipeline track (source "tools" - see combine.py's process_central_tool_dir); byPlugin is
+    // everything with no Ballerina-version concept (currently just ballerina-vscode, grouped by
+    // scanned branch instead of package version). All four feed the same React PackageTable.
     resource function get api/summary() returns json|http:Response {
         CachedSnapshot|error snapshot = getSnapshotOrRefresh();
         if snapshot is error {
@@ -74,6 +75,7 @@ service / on new http:Listener(port) {
             runUrl: snapshot.runUrl,
             stale,
             byVersionAndSource: summarizeByVersionAndSource(snapshot.report).toJson(),
+            byLanguageCore: summarizeByLanguageCore(snapshot.report).toJson(),
             byPackage: summarizeByPackage(snapshot.report).toJson(),
             byPlugin: summarizeByPlugin(snapshot.report).toJson(),
             byTool: summarizeByTool(snapshot.report).toJson(),

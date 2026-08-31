@@ -4,7 +4,7 @@ import integration_security_tools/dashboard_backend.model;
 // service to unit-test directly (see tests/aggregate_test.bal).
 
 // Named once so the summarize* functions below can't drift from each other or from
-// combine.py/issue_sync.py's literal strings via a typo. The three summarize* functions using
+// combine.py/issue_sync.py's literal strings via a typo. The four summarize* functions using
 // these MUST partition report.findings - every source belongs to exactly one view, never zero
 // and never two (see tests/aggregate_test.bal's testEverySourceBelongsToExactlyOneView).
 const string SOURCE_DISTRIBUTION = "distribution";
@@ -243,13 +243,23 @@ function groupIntoSummaries(model:Finding[] findings) returns PackageSummary[] {
         select p;
 }
 
-// Explicit ALLOWLIST, not "everything except vscode-extension" - the old negative filter meant
-// any newly-added source (this is exactly what happened when "tools" was added) would silently
-// land in the Packages view instead of its own. Central packages and distribution only.
+// "Language Core" - what ships as part of the ballerina-lang distribution itself (source
+// "distribution"), kept SEPARATE from Packages: it's a fundamentally different thing from a
+// connector/library published on Central (no package_org, a single "ballerina-lang" identity,
+// grouped by Ballerina release line rather than package version - see buildVersionGroups'
+// "ballerina-lang" branch), and conflating the two made "how many real Central packages have
+// findings" impossible to read off the Packages count directly.
+public function summarizeByLanguageCore(model:CombinedReport report) returns PackageSummary[] {
+    model:Finding[] coreFindings = from var f in report.findings where f.'source == SOURCE_DISTRIBUTION select f;
+    return groupIntoSummaries(coreFindings);
+}
+
+// Explicit allowlist of exactly "central" - Central packages/connectors only. Distribution
+// (Language Core) and vscode-extension (Plugins) each get their own view instead of being lumped
+// in here (a plain negative filter meant any newly-added source, exactly what happened when
+// "tools" was added, would silently land in Packages instead of its own view).
 public function summarizeByPackage(model:CombinedReport report) returns PackageSummary[] {
-    model:Finding[] packageFindings = from var f in report.findings
-        where f.'source == SOURCE_DISTRIBUTION || f.'source == SOURCE_CENTRAL
-        select f;
+    model:Finding[] packageFindings = from var f in report.findings where f.'source == SOURCE_CENTRAL select f;
     return groupIntoSummaries(packageFindings);
 }
 
