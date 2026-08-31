@@ -29,6 +29,14 @@ Inputs, per configured version line:
   --vscode-trivyignore <branch>=<path>  ballerina-vscode's own .trivyignore file(s) for that
                                          branch (the fs scan's repo+submodule files, the ls scan's
                                          language-server one) - merged per branch. Repeatable.
+  --central-tool-dir <line>=<path>      a directory produced by bala_scan.py run against
+                                         central_resolve.py's --kind tools output (source
+                                         "tools") - same manifest.json + per-tool trivy report
+                                         shape as --central-dir, but a DELIBERATELY SEPARATE
+                                         processing path (see process_central_tool_dir) so a bug
+                                         in tool handling is structurally incapable of touching
+                                         the package path. Repeatable.
+  --central-tool-status <line>=ok|<error message>   mirrors --central-status for the tools track.
 
 Accepted-risk handling: a finding whose CVE appears in the relevant .trivyignore is NEVER
 dropped - it's tagged with `accepted_risk: {reason, source}` (reason = the comment text above
@@ -50,6 +58,11 @@ version-scoped (once a package's same version could be resolved under multiple l
 exclusion added to only one line's branch left it active under the other). A package with no
 resolved repo, or whose repo has no .trivyignore, simply gets no accepted_risk tag for that CVE -
 there is NO fallback to ballerina-distribution's file for Central findings anymore.
+
+Tools accepted-risk handling: TODO(tools-trivyignore) - Central bal TOOLS (source "tools", see
+process_central_tool_dir) have NO accepted-risk/.trivyignore path at all yet. Deliberately
+deferred, not an oversight - grep "tools-trivyignore" for every spot that needs to change
+together when this resumes.
 
 Package identity is (package_org, package_name) - "ballerina-lang" (package_org=None) for
 distribution-source findings, or the actual Central org/name (e.g. "ballerinax"/"redis") for
@@ -330,6 +343,54 @@ def process_central_dir(line, central_dir, findings_out):
         findings_out.extend(deduped)
 
 
+def process_central_tool_dir(line, tool_dir, findings_out):
+    """
+    Central bal TOOLS - a DELIBERATELY SEPARATE track from process_central_dir above, not a
+    parameterization of it: tools are discovered through a completely different registry endpoint
+    (see central_resolve.py's list_candidate_tools) and are a much smaller, less-exercised
+    population, so a bug here must be structurally incapable of touching the package path that
+    already runs in production. Keep the two in sync by hand if their shared shape ever changes.
+
+    Divergences from process_central_dir, all intentional:
+      - source is "tools", never "central" - never merged with packages when aggregating.
+      - tool_id carries balToolId (e.g. "scan"), threaded from central_resolve.py via
+        bala_scan.py's manifest. It is NOT derivable from package_name ("tool_scan") and has no
+        naming convention - issue_sync.py titles a tool's issue with this alone.
+      - No accepted-risk lookup at all - see TODO(tools-trivyignore) in the module docstring.
+        `repo` is still carried through on the manifest entry (sourceCodeLocation only - the
+        module-{org}-{name} guess is useless for tools) so the data is already there once that
+        work resumes; the fix then is to call load_package_trivyignore(pkg.get("repo")) here
+        exactly as process_central_dir already does.
+    """
+    manifest_path = os.path.join(tool_dir, "manifest.json")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    for tool in manifest.get("scanned", []):
+        report_path = os.path.join(tool_dir, tool["report"])
+        if not os.path.exists(report_path):
+            continue
+        raw = []
+        for target, cve, severity, trivy_pkg_name, installed, fixed in parse_trivy_report(report_path):
+            raw.append({
+                "ballerina_version": line,
+                "source": "tools",
+                "package_org": tool["org"],
+                "package_name": tool["name"],
+                "package_version": tool["version"],
+                "tool_id": tool.get("balToolId"),
+                "library_name": trivy_pkg_name,
+                "jar": os.path.basename(target),
+                "cve": cve,
+                "severity": severity,
+                "installed_version": installed,
+                "fixed_version": fixed,
+            })
+        # Same key as process_central_dir: within ONE tool's ONE version's scan, a CVE reported
+        # against several bundled jars (tool/libs/*.jar) is one finding.
+        findings_out.extend(dedupe_within_source(raw, lambda f: f["cve"]))
+
+
 def _current_run_url():
     """
     The GitHub Actions run URL for this pipeline execution, built from the standard env vars
@@ -372,6 +433,8 @@ def main():
     ap.add_argument("--vscode-status", action="append", default=[])
     ap.add_argument("--dist-trivyignore", action="append", default=[])
     ap.add_argument("--vscode-trivyignore", action="append", default=[])
+    ap.add_argument("--central-tool-dir", action="append", default=[])
+    ap.add_argument("--central-tool-status", action="append", default=[])
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -383,10 +446,12 @@ def main():
     vscode_status = parse_kv_args(args.vscode_status)
     dist_trivyignore_paths = parse_kv_args(args.dist_trivyignore)
     vscode_trivyignore_paths = parse_kv_list_args(args.vscode_trivyignore)
+    central_tool_dirs = parse_kv_args(args.central_tool_dir)
+    central_tool_status = parse_kv_args(args.central_tool_status)
 
     findings = []
     scan_status = []
-    versions = sorted(set(list(dist_reports) + list(central_dirs)))
+    versions = sorted(set(list(dist_reports) + list(central_dirs) + list(central_tool_dirs)))
 
     for line in versions:
         # ballerina-distribution's file - distribution findings ONLY. Central findings resolve
@@ -430,6 +495,27 @@ def main():
         else:
             scan_status.append({
                 "ballerina_version": line, "source": "central",
+                "ok": False, "error": "no report produced",
+            })
+
+        if line in central_tool_dirs:
+            try:
+                process_central_tool_dir(line, central_tool_dirs[line], findings)
+                ok = central_tool_status.get(line, "ok") == "ok"
+                scan_status.append({
+                    "ballerina_version": line, "source": "tools",
+                    "ok": ok, "error": None if ok else central_tool_status.get(line),
+                })
+            except Exception as e:  # noqa: BLE001
+                scan_status.append({
+                    "ballerina_version": line, "source": "tools",
+                    "ok": False, "error": str(e),
+                })
+        else:
+            # A failed/missing tools job must never be indistinguishable from a clean one - same
+            # discipline as the distribution/central "no report produced" branches above.
+            scan_status.append({
+                "ballerina_version": line, "source": "tools",
                 "ok": False, "error": "no report produced",
             })
 

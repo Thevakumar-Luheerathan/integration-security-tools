@@ -6,13 +6,18 @@ at Thevakumar-Luheerathan/integration-engineering, a personal fork, while this p
 being built/tested; migrating was just a --tracking-repo + token-access swap, no redesign).
 
 Design (confirmed with user):
-  - One issue per package, keyed on (package_org, package_name) - e.g. "ballerinax"/"redis", or
-    package_name="ballerina-lang" for the distribution source. There is deliberately no
-    repo-resolution step (see combine.py's docstring) - library owners already know which repo
-    their package lives in, so the issue TITLE uses a purely cosmetic, unverified naming
-    convention (module-{org}-{name}, or "ballerina-lang" verbatim) for human readability only.
-    Nothing links or routes on that string - the real identity used for grouping/dedup is
-    (package_org, package_name) from the finding data itself.
+  - One issue per package (or tool), keyed on (source, package_org, package_name) - e.g.
+    "central"/"ballerinax"/"redis", or package_name="ballerina-lang" for the distribution
+    source. `source` is part of the key (not just package_org/package_name) so a Central "tools"
+    finding can never merge into a same-named regular package's group - see main()'s by_package
+    comment. There is deliberately no repo-resolution step for regular packages (see combine.py's
+    docstring) - library owners already know which repo their package lives in, so the issue
+    TITLE uses a purely cosmetic, unverified naming convention (module-{org}-{name}, or
+    "ballerina-lang" verbatim) for human readability only - see group_display_name for the
+    per-source display rule (tools use their balToolId alone instead, e.g. "scan tool", since
+    the module-{org}-{name} convention is confirmed actively misleading for them). Nothing links
+    or routes on that string - the real identity used for grouping/dedup is
+    (source, package_org, package_name) from the finding data itself.
   - The issue body is organized package -> version -> CVE: each distinct package version (or,
     for ballerina-lang, each Ballerina release line) gets its own subsection, listing only the
     CVEs that belong to THAT version - never a flat merged list, since two versions of the same
@@ -88,8 +93,30 @@ def display_name(package_org, package_name):
     return f"module-{package_org}-{package_name}"
 
 
-def issue_title(package_org, package_name):
-    return f"[Trivy] Vulnerabilities found in {display_name(package_org, package_name)}"
+def group_display_name(findings):
+    """
+    THE one place that decides what a finding group is called. Computed once per group in
+    main() and threaded down through sync_package/create_issue/issue_title/render_body -
+    deliberately never re-derived at a lower layer. The title IS the lookup key
+    (find_package_issues matches on exact title text), so a layer deriving it even slightly
+    differently would miss the existing issue and file a duplicate on every single run.
+
+    `findings` is never empty here: main() computes this from a group's FULL finding list, not
+    the trackable subset, which can legitimately be empty (all-accepted-risk auto-close).
+    """
+    first = findings[0]
+    if first.get("source") == "tools":
+        # balToolId ALONE (e.g. "scan" for ballerina/tool_scan), read naturally as "...found in
+        # scan tool". NOT module-{org}-{name}: that convention is confirmed actively MISLEADING
+        # for tools (ballerina/tool_scan actually lives in
+        # ballerina-platform/static-code-analysis-tool). NOT {org}/{name} either - the tool id is
+        # what its users and maintainers actually call it (`bal tool pull scan`).
+        return f"{first.get('tool_id') or first['package_name']} tool"
+    return display_name(first["package_org"], first["package_name"])
+
+
+def issue_title(display):
+    return f"[Trivy] Vulnerabilities found in {display}"
 
 
 def find_package_issues(tracking_repo, title):
@@ -403,48 +430,90 @@ def render_finding_row(f):
     return f"| {finding_scope(f)} | {jar} | {f['cve']} | {f['severity']} | {f['installed_version']} | {fixed} |"
 
 
-def render_body(package_org, package_name, findings, suppressed_count):
+def render_body(display, package_name, findings, suppressed_count):
     """
     Only ever called once, by create_issue() - an already-open issue's body is never rewritten
     again (see comment_new_findings for how ongoing updates work instead). This snapshot reflects
     the findings active at creation time only; it will not stay in sync as the issue evolves.
     """
-    name = display_name(package_org, package_name)
-    # Where an unfixed CVE should be documented via .trivyignore before closing - the vscode
-    # extension is tracked in its own repo/branch, everything else (distribution + Central, for
-    # every Ballerina version line) is tracked in ballerina-distribution's per-line branch.
-    trivyignore_target = (
-        "ballerina-vscode's own branch"
-        if package_name == "ballerina-vscode"
-        else "ballerina-distribution's branch for this Ballerina version line"
-    )
-    lines = [
-        f"Automatically tracked vulnerabilities for `{name}`.",
-        "",
-        f"- This issue's body reflects the findings active when it was **created** - it is "
-        f"never rewritten after that.",
-        f"- New findings detected while this issue stays open are posted as **comments below**, "
-        f"not edits to this body.",
-        "",
-        "**How acknowledgement works:**",
-        "",
-        "- Acknowledging a finding means **closing this issue** - there's no separate flag or "
-        "label, closing this issue is the acknowledgment.",
-        "- Close this issue once you've made a call on it: already fixed upstream (release "
-        "pending), won't-fix, tracked elsewhere, accepted risk, etc.",
-        f"- **If a CVE will not actually be fixed** (or won't be fixed soon), also add it to "
-        f"`.trivyignore` (with a reason) in {trivyignore_target} before closing - that documents "
-        f"it as a deliberate, accepted risk instead of silently suppressing it with no paper "
-        f"trail. Once it's in `.trivyignore`, future scans will tag it `accepted_risk` directly "
-        f"and it will stop appearing in issues/comments at all.",
-        "- Once closed, every CVE mentioned in this issue (body + comments) is treated as "
-        "acknowledged - if the exact same CVE shows up again in a future scan, it is silently "
-        "suppressed, not reopened and not re-surfaced as a new issue.",
-        "- A genuinely **different** CVE for this same package always gets its own fresh issue - "
-        "closing this one does not block future issues for this package.",
-        "- Once closed, this issue is never reopened and its body is never edited again by the "
-        "pipeline.",
-    ]
+    source = findings[0].get("source")
+    # `source` is derived locally here rather than threaded like `display` - a display-name
+    # mismatch is catastrophic (duplicate issues, see group_display_name), a prose mismatch here
+    # is merely cosmetic, so it doesn't need the same single-source-of-truth discipline.
+    if source == "tools":
+        tool_id = findings[0].get("tool_id") or display
+        acknowledgement_lines = [
+            "- Acknowledging a finding means **closing this issue** - there's no separate flag or "
+            "label, closing this issue is the acknowledgment.",
+            "- Close this issue once you've made a call on it: already fixed upstream (release "
+            "pending), won't-fix, tracked elsewhere, accepted risk, etc.",
+            # TODO(tools-trivyignore): no .trivyignore/accepted-risk path exists for tools yet
+            # (see combine.py's process_central_tool_dir) - this must NOT tell a tool owner to
+            # add a CVE to a file nothing reads. Restore the standard wording (pointed at the
+            # tool's own repo) once that work resumes.
+            "- **There is no `.trivyignore`-based accepted-risk path for Ballerina tools yet** - "
+            "if a CVE will not actually be fixed, say so in a comment before closing; closing "
+            "this issue is currently the only acknowledgement mechanism available for tools.",
+            "- Once closed, every CVE mentioned in this issue (body + comments) is treated as "
+            "acknowledged - if the exact same CVE shows up again in a future scan, it is silently "
+            "suppressed, not reopened and not re-surfaced as a new issue.",
+            "- A genuinely **different** CVE for this same tool always gets its own fresh issue - "
+            "closing this one does not block future issues for this tool.",
+            "- Once closed, this issue is never reopened and its body is never edited again by "
+            "the pipeline.",
+        ]
+        lines = [
+            f"Automatically tracked vulnerabilities for the Ballerina tool `{tool_id}` "
+            f"(published on Ballerina Central as `{findings[0]['package_org']}/{findings[0]['package_name']}`).",
+            "",
+            f"- This issue's body reflects the findings active when it was **created** - it is "
+            f"never rewritten after that.",
+            f"- New findings detected while this issue stays open are posted as **comments below**, "
+            f"not edits to this body.",
+            "",
+            "**How acknowledgement works:**",
+            "",
+            *acknowledgement_lines,
+        ]
+    else:
+        # Where an unfixed CVE should be documented via .trivyignore before closing. Drive-by fix
+        # (unrelated to tools): this used to read "ballerina-distribution's branch" for Central
+        # findings too, which went stale the moment Phase 2 moved Central to a per-package repo
+        # lookup (see combine.py's "Central accepted-risk handling") - still correct for
+        # distribution findings, which do still share that one file.
+        if package_name == "ballerina-vscode":
+            trivyignore_target = "ballerina-vscode's own branch"
+        elif source == "central":
+            trivyignore_target = "your package's own repo"
+        else:
+            trivyignore_target = "ballerina-distribution's branch for this Ballerina version line"
+        lines = [
+            f"Automatically tracked vulnerabilities for `{display}`.",
+            "",
+            f"- This issue's body reflects the findings active when it was **created** - it is "
+            f"never rewritten after that.",
+            f"- New findings detected while this issue stays open are posted as **comments below**, "
+            f"not edits to this body.",
+            "",
+            "**How acknowledgement works:**",
+            "",
+            "- Acknowledging a finding means **closing this issue** - there's no separate flag or "
+            "label, closing this issue is the acknowledgment.",
+            "- Close this issue once you've made a call on it: already fixed upstream (release "
+            "pending), won't-fix, tracked elsewhere, accepted risk, etc.",
+            f"- **If a CVE will not actually be fixed** (or won't be fixed soon), also add it to "
+            f"`.trivyignore` (with a reason) in {trivyignore_target} before closing - that documents "
+            f"it as a deliberate, accepted risk instead of silently suppressing it with no paper "
+            f"trail. Once it's in `.trivyignore`, future scans will tag it `accepted_risk` directly "
+            f"and it will stop appearing in issues/comments at all.",
+            "- Once closed, every CVE mentioned in this issue (body + comments) is treated as "
+            "acknowledged - if the exact same CVE shows up again in a future scan, it is silently "
+            "suppressed, not reopened and not re-surfaced as a new issue.",
+            "- A genuinely **different** CVE for this same package always gets its own fresh issue - "
+            "closing this one does not block future issues for this package.",
+            "- Once closed, this issue is never reopened and its body is never edited again by the "
+            "pipeline.",
+        ]
     if suppressed_count:
         lines.append(
             f"\n_{suppressed_count} finding(s) for this package matched a CVE already covered "
@@ -465,9 +534,9 @@ def render_body(package_org, package_name, findings, suppressed_count):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def create_issue(tracking_repo, package_org, package_name, active_findings, dry_run):
-    title = issue_title(package_org, package_name)
-    body = render_body(package_org, package_name, active_findings, suppressed_count=0)
+def create_issue(tracking_repo, display, package_name, active_findings, dry_run):
+    title = issue_title(display)
+    body = render_body(display, package_name, active_findings, suppressed_count=0)
     # Approximated as "now" rather than a follow-up `gh issue view` round-trip - a few seconds of
     # drift from the real creation timestamp is irrelevant for a "been open more than a week"
     # staleness check.
@@ -536,10 +605,15 @@ def close_issue(tracking_repo, issue, dry_run):
     gh(["issue", "close", str(issue["number"]), "--repo", tracking_repo])
 
 
-def sync_package(tracking_repo, package_org, package_name, findings, dry_run, parent_number):
+def sync_package(tracking_repo, display, package_name, findings, dry_run, parent_number):
     """
     Returns a dict mapping each finding's id(finding) -> issue ref, per the lifecycle described
     in the module docstring. Never reopens or rewrites a closed issue.
+
+    `display` is the pre-computed group_display_name(...) - see its docstring for why this is
+    threaded rather than re-derived here (the title is the lookup key; re-deriving it at this
+    layer risks it drifting from what create_issue used, which would file a duplicate issue on
+    every run).
 
     parent_number is the ongoing parent tracking issue (see find_or_create_parent_issue) - only
     ever used right below, when this package's issue is BRAND NEW (create_issue branch). An
@@ -547,7 +621,7 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run, pa
     re-attaching it every subsequent sync would be redundant (and GitHub would just reject the
     duplicate sub-issue link anyway).
     """
-    title = issue_title(package_org, package_name)
+    title = issue_title(display)
     open_issue, closed_issues = find_package_issues(tracking_repo, title)
 
     def finding_key(f):
@@ -581,7 +655,7 @@ def sync_package(tracking_repo, package_org, package_name, findings, dry_run, pa
             else:
                 ref = issue_ref(open_issue)
         else:
-            ref = create_issue(tracking_repo, package_org, package_name, active, dry_run)
+            ref = create_issue(tracking_repo, display, package_name, active, dry_run)
             add_sub_issue(tracking_repo, parent_number, ref["number"], dry_run)
         for f in active:
             issue_refs[id(f)] = ref
@@ -624,23 +698,34 @@ def main():
     # scan time (via .trivyignore), so they never influence issue creation/update/closing and
     # never get an issue reference written (stays None from the setdefault above) - tracked via
     # their accepted_risk field instead, not a GitHub issue.
+    # Keyed on (source, package_org, package_name), not just (package_org, package_name) -
+    # provably a no-op for today's data (no existing (org,name) pair spans two sources), but
+    # closes a real future footgun: a tool is a real Central package, invisible to the package
+    # track today only because that track's enumeration filters on the latest version's
+    # `platform`. If a tool ever ships a platform.java21 block, it becomes independently
+    # enumerable by BOTH tracks, and an un-sourced key would nondeterministically merge them into
+    # one group whose title flips between runs depending on findings[0] - exactly the cross-track
+    # bleed the separate-tools-track decision exists to prevent.
     by_package = defaultdict(list)
     for finding in combined["findings"]:
-        by_package[(finding["package_org"], finding["package_name"])].append(finding)
+        by_package[(finding["source"], finding["package_org"], finding["package_name"])].append(finding)
 
-    for (package_org, package_name), all_findings in by_package.items():
+    for (finding_source, package_org, package_name), all_findings in by_package.items():
         trackable = [f for f in all_findings if not f.get("accepted_risk")]
         accepted_count = len(all_findings) - len(trackable)
+        # From all_findings, not trackable: trackable can be legitimately empty (an all-accepted
+        # -risk package/tool still gets synced so a previously-open issue can auto-close), and
+        # group_display_name needs at least one finding regardless.
+        display = group_display_name(all_findings)
 
-        issue_refs = sync_package(args.tracking_repo, package_org, package_name, trackable, args.dry_run, parent_number)
+        issue_refs = sync_package(args.tracking_repo, display, package_name, trackable, args.dry_run, parent_number)
         active_count = sum(1 for f in trackable if issue_refs.get(id(f), {}).get("state") == "open")
         suppressed_count = len(trackable) - active_count
         for f in trackable:
             f["issue"] = issue_refs.get(id(f))
-        name = display_name(package_org, package_name)
         active_ref = next((r for r in issue_refs.values() if r["state"] == "open"), None)
         print(
-            f"{name}: {active_count} active, {suppressed_count} suppressed, {accepted_count} "
+            f"{display}: {active_count} active, {suppressed_count} suppressed, {accepted_count} "
             f"accepted-risk -> issue {active_ref.get('url') if active_ref else '(none open)'}",
             file=sys.stderr,
         )

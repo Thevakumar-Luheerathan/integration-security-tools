@@ -4,7 +4,9 @@ Download a set of resolved Ballerina Central packages (.bala files) and trivy-sc
 
 Input: the JSON produced by central_resolve.py - a list of
   {"org", "name", "version", "ballerinaVersion", "platform", "balaURL", "digest", "resolved_at",
-   "repo"}
+   "repo", "balToolId"}
+(balToolId only populated when central_resolve.py ran with --kind tools - None/absent for regular
+packages, which is exactly what combine.py's package path expects.)
 
 A .bala is just a zip archive that bundles every third-party JAR the package ships (verified
 during design by extracting a real one - platform/java21/*.jar plus compiler-plugin/libs/*.jar).
@@ -17,7 +19,7 @@ sequential run), we re-fetch that package's metadata to get a fresh URL rather t
 
 Output: for each package, a trivy JSON report at <out-dir>/<org>__<name>__<version>.trivy.json,
 plus a manifest.json mapping report files back to package metadata (org/name/version/
-ballerinaVersion/repo) so combine.py doesn't have to re-derive it from the filename.
+ballerinaVersion/repo/balToolId) so combine.py doesn't have to re-derive it from the filename.
 """
 import argparse
 import concurrent.futures
@@ -129,13 +131,17 @@ def main():
                 # Must be explicitly carried here: this dict is built fresh, not a copy of `pkg`,
                 # so any field not named here (this one included, before this fix) is silently
                 # dropped before combine.py ever sees it.
-                "repo": pkg.get("repo"), "error": None,
+                "repo": pkg.get("repo"),
+                # Same trap as `repo` above: only populated for the tools track (--kind tools in
+                # central_resolve.py); None for regular packages, which is exactly what
+                # combine.py's package path expects.
+                "balToolId": pkg.get("balToolId"), "error": None,
             }
         except Exception as e:  # noqa: BLE001 - record and continue; one bad package shouldn't kill the run
             return {
                 "org": pkg["org"], "name": pkg["name"], "version": pkg["version"],
                 "ballerinaVersion": pkg.get("ballerinaVersion"), "repo": pkg.get("repo"),
-                "report": None, "error": str(e),
+                "balToolId": pkg.get("balToolId"), "report": None, "error": str(e),
             }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:

@@ -2,10 +2,14 @@ name: Trivy Vulnerability Scan
 
 # Phase 1 of the proactive vulnerability scanning initiative
 # (see wso2-enterprise/integration-engineering#2164). Scans, per configured Ballerina release
-# line, both:
+# line, three sources:
 #   - "distribution": what ships (built from the ballerina-lang release branch)
-#   - "central": what's published on Ballerina Central (incl. connectors), latest version
-#     compatible with that line
+#   - "central": what's published on Ballerina Central (incl. connectors), every compatible
+#     version per line (see central_resolve.py's selection rule)
+#   - "tools": Ballerina Central bal TOOLS (bal tool pull CLI packages) - a fully SEPARATE track
+#     end-to-end (own job below, own central_resolve.py --kind tools invocation, own combine.py
+#     processing function) discovered through a completely different registry endpoint
+#     (/registry/tools) that the "central" track's enumeration never sees
 # kept as SEPARATE sources (never merged) so a CVE already fixed on Central but not yet in the
 # next distribution release stays visible as such. Findings are synced to one GitHub issue per
 # affected repo (no database - GitHub Issues are the state store) and the combined result is
@@ -70,13 +74,14 @@ jobs:
           echo "vscode_branches=$VBRANCHES" >> "$GITHUB_OUTPUT"
           echo "Active ballerina-vscode branches: $VBRANCHES"
 
-      # ballerina-distribution's own per-branch .trivyignore is the org's ONE established place
-      # for accepted-risk tracking (verified real: 2201.12.x/2201.13.x have substantially
-      # different, richly-commented content) - fetched once here per line and applied to BOTH
-      # distribution-scan and central-scan findings for that line in combine.py (no per-Central-
-      # package repo lookup needed - that's exactly the fragile mechanism dropped earlier).
-      # Plain raw.githubusercontent.com fetch: public repo, no auth needed. A line with no
-      # .trivyignore at that ref just gets no file - combine.py treats that as "nothing accepted".
+      # ballerina-distribution's own per-branch .trivyignore, fetched once here per line - applied
+      # ONLY to distribution findings for that line (see combine.py's "Central accepted-risk
+      # handling"): Central findings resolve their own per-package repo's .trivyignore instead
+      # (a later change from when this file was ONE shared list for both distribution and
+      # central), and Central "tools" findings have no accepted-risk path at all yet
+      # (TODO(tools-trivyignore) in combine.py). Plain raw.githubusercontent.com fetch: public
+      # repo, no auth needed. A line with no .trivyignore at that ref just gets no file -
+      # combine.py treats that as "nothing accepted".
       - name: Fetch ballerina-distribution's per-line .trivyignore
         run: |
           mkdir -p dist-trivyignore
@@ -242,6 +247,67 @@ jobs:
           path: central-reports/
           retention-days: 14
 
+  tools-scan:
+    name: Scan Central tools (${{ matrix.line }})
+    # A DELIBERATELY SEPARATE track from central-scan, not extra steps inside it: Central bal
+    # tools are discovered through a different registry endpoint (/registry/tools) and are a
+    # small, newly-added population, so a failure here must not be able to take down the
+    # already-production package scan for the same line. Same per-line matrix, so a tool's
+    # versions are resolved per configured line exactly like a package's.
+    needs: [generate-matrix, warm-trivy-db]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout this repo (for pipeline scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ github.run_id }}
+          # Best-effort - see the matching comment in the distribution-scan job.
+
+      - name: Ensure trivy DB is present and fresh
+        run: |
+          trivy image --download-db-only --cache-dir /tmp/trivy-cache
+          trivy image --download-java-db-only --cache-dir /tmp/trivy-cache
+
+      - name: Resolve Central tools compatible with ${{ matrix.line }}
+        run: |
+          python3 trivy-vuln-scan/scripts/central_resolve.py \
+            --kind tools \
+            --line "${{ matrix.line }}" \
+            --out tools.json \
+            --failures-out tool-resolve-failures.json \
+            --workers 6
+
+      - name: Download + scan each tool's .bala
+        run: |
+          python3 trivy-vuln-scan/scripts/bala_scan.py \
+            --packages tools.json \
+            --out-dir tools-reports \
+            --trivy-cache-dir /tmp/trivy-cache \
+            --workers 4
+          cp tool-resolve-failures.json tools-reports/resolve-failures.json || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tools-${{ matrix.line }}
+          path: tools-reports/
+          retention-days: 14
+
   vscode-fs-scan:
     name: Scan ballerina-vscode (fs, ${{ matrix.branch }})
     needs: [generate-matrix, warm-trivy-db]
@@ -393,7 +459,7 @@ jobs:
 
   combine:
     name: Combine results + sync issues
-    needs: [generate-matrix, distribution-scan, central-scan, vscode-fs-scan, vscode-ls-scan]
+    needs: [generate-matrix, distribution-scan, central-scan, tools-scan, vscode-fs-scan, vscode-ls-scan]
     # TEMPORARY (per user request, to test the rest of the pipeline while
     # distribution-scan is blocked on an upstream maven.wso2.org outage): run this job even
     # if an upstream scan job failed, instead of skipping combine entirely. combine.py already
@@ -428,6 +494,14 @@ jobs:
           pattern: "central-*"
           path: artifacts/central
 
+      # A DISTINCT pattern from "central-*" on purpose - "central-tools-..." would ALSO match
+      # "central-*" and silently dump tool artifacts into the packages directory above.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: "tools-*"
+          path: artifacts/tools
+
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -454,10 +528,12 @@ jobs:
 
           DIST_ARGS=()
           CENTRAL_ARGS=()
+          TOOL_ARGS=()
           IGNORE_ARGS=()
           for line in $LINES; do
             DIST_REPORT="artifacts/distribution/distribution-${line}/distribution-report.json"
             CENTRAL_DIR="artifacts/central/central-${line}"
+            TOOLS_DIR="artifacts/tools/tools-${line}"
             DIST_IGNORE="artifacts/dist-trivyignore/${line}.trivyignore"
             if [ -f "$DIST_REPORT" ]; then
               DIST_ARGS+=(--distribution-report "${line}=${DIST_REPORT}")
@@ -465,8 +541,11 @@ jobs:
             if [ -d "$CENTRAL_DIR" ]; then
               CENTRAL_ARGS+=(--central-dir "${line}=${CENTRAL_DIR}")
             fi
-            # Same file applies to BOTH distribution and central findings for this line - ONE
-            # shared accepted-risk list per the confirmed design, not per-package.
+            if [ -d "$TOOLS_DIR" ]; then
+              TOOL_ARGS+=(--central-tool-dir "${line}=${TOOLS_DIR}")
+            fi
+            # Distribution findings ONLY - Central (package and tools) findings resolve their own
+            # accepted-risk state elsewhere (or not at all yet, for tools) - see combine.py.
             if [ -f "$DIST_IGNORE" ]; then
               IGNORE_ARGS+=(--dist-trivyignore "${line}=${DIST_IGNORE}")
             fi
@@ -493,7 +572,7 @@ jobs:
           done
 
           python3 trivy-vuln-scan/scripts/combine.py \
-            "${DIST_ARGS[@]}" "${CENTRAL_ARGS[@]}" "${VSCODE_ARGS[@]}" "${IGNORE_ARGS[@]}" \
+            "${DIST_ARGS[@]}" "${CENTRAL_ARGS[@]}" "${TOOL_ARGS[@]}" "${VSCODE_ARGS[@]}" "${IGNORE_ARGS[@]}" \
             --out combined.json
 
       - name: Sync findings to tracking issues

@@ -46,6 +46,26 @@ read that package's OWN .trivyignore instead of the shared distribution-wide one
 docstring). Also writes a small sidecar of packages that could NOT be resolved (network errors,
 monotonicity anomalies needing a fallback that also failed) so failures are visible instead of
 silently dropped.
+
+Tools (--kind tools): Ballerina Central bal TOOLS (bal tool pull CLI packages, e.g. "scan",
+"persist") are enumerated through a COMPLETELY SEPARATE registry endpoint (/registry/tools, not
+/registry/packages) - verified they are 100% invisible to list_candidate_packages above, since
+that one filters on a package's LATEST version's `platform=java21` etc, and a tool's bala has no
+platform/java21 block at all (its jars live under tool/libs/, not platform/java21/). Real count:
+22 tools across the 4 configured orgs (12 ballerina, 3 ballerinax, 7 wso2, 0 xlibb).
+
+Once a tool's (org, name) is known, though, EVERY function below this point is reused completely
+unchanged - verified directly: /registry/packages/{org}/{name} and .../packages/{org}/{name}/
+{version} work identically for a tool's own `name` field (e.g. "tool_scan"), returning the same
+newest-first version list and the same full metadata shape, including `balToolId`. The tool-
+specific /registry/tools/{toolId} endpoint is a dead end (only the latest version, no history) and
+is never used here. `balToolId` (e.g. "scan") is NOT derivable from `name` and has no naming
+convention at all ("tool_scan", "tool.persist", "wsdltool" all coexist) - it's captured at
+discovery time in list_candidate_tools and stamped onto each resolved version in main(). The
+module-{org}-{name} repo-guess in resolve_package_repo is confirmed USELESS for tools (a tool's
+repo bears no relation to its package name - ballerina/tool_scan lives in
+ballerina-platform/static-code-analysis-tool) so main() skips straight to sourceCodeLocation-only
+resolution for the tools track, never attempting the guess.
 """
 import argparse
 import concurrent.futures
@@ -152,6 +172,35 @@ def list_candidate_packages(orgs, platforms):
                     seen.add(key)
                     candidates.append(key)
     return candidates
+
+
+def list_candidate_tools(orgs):
+    """
+    Enumerate (org, name) tool candidates via the DISTINCT /registry/tools listing endpoint -
+    tools are 100% invisible to list_candidate_packages above (verified - see module docstring).
+    No platform filter needed: every real tool observed in production is platform=java21, and
+    the endpoint doesn't behave differently with or without one (verified directly against the
+    real API).
+
+    Returns (candidates, tool_ids): candidates in the same [(org, name), ...] shape
+    list_candidate_packages returns, so every downstream resolution function is reached with an
+    identical argument, plus a {(org, name): balToolId} sidecar - balToolId is not derivable from
+    `name` and has no naming convention, so it must be captured here at discovery time.
+    """
+    seen = set()
+    candidates = []
+    tool_ids = {}
+    for org in orgs:
+        data = _json(f"{API_BASE}/tools?org={org}&limit=1000")
+        if not data:
+            continue
+        for tool in data.get("tools", []):
+            key = (tool["organization"], tool["name"])
+            if key not in seen:
+                seen.add(key)
+                candidates.append(key)
+                tool_ids[key] = tool.get("balToolId")
+    return candidates, tool_ids
 
 
 def resolve_package_for_line(org, name, target_tuple, platforms):
@@ -414,15 +463,32 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--failures-out", default=None)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--kind", choices=["packages", "tools"], default="packages",
+                     help="what to enumerate: regular Central packages, or Central bal tools "
+                          "(a separate registry listing - see list_candidate_tools). Everything "
+                          "AFTER enumeration is identical for both.")
     args = ap.parse_args()
 
     orgs = [o.strip() for o in args.orgs.split(",") if o.strip()]
     platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
     target_tuple = line_to_tuple(args.line)
 
-    print(f"Enumerating candidates in orgs={orgs} platforms={platforms} ...", file=sys.stderr)
-    candidates = list_candidate_packages(orgs, platforms)
-    print(f"{len(candidates)} candidate packages found.", file=sys.stderr)
+    tool_ids = {}
+    if args.kind == "tools":
+        print(f"Enumerating tools in orgs={orgs} ...", file=sys.stderr)
+        candidates, tool_ids = list_candidate_tools(orgs)
+        print(f"{len(candidates)} candidate tools found.", file=sys.stderr)
+        if not candidates:
+            # 22 real tools exist across the 4 configured orgs (verified) - zero means the
+            # listing call failed or its response shape changed, NOT "no tools are vulnerable".
+            # Exit non-zero so the workflow job fails visibly, rather than silently publishing a
+            # false-clean tools track.
+            print("ERROR: /registry/tools returned no tools for any configured org.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Enumerating candidates in orgs={orgs} platforms={platforms} ...", file=sys.stderr)
+        candidates = list_candidate_packages(orgs, platforms)
+        print(f"{len(candidates)} candidate packages found.", file=sys.stderr)
 
     resolved = []
     failures = []
@@ -451,7 +517,23 @@ def main():
                 # a package's 2nd+ selected version (e.g. ballerina/ai's 15 versions).
                 for r in result:
                     r["resolved_at"] = time.time()
-                    r["repo"] = resolve_package_repo(r["org"], r["name"], r.get("sourceCodeLocation"))
+                    if args.kind == "tools":
+                        # The listing gives the tool's LATEST balToolId - applied to every
+                        # selected version of it, since a tool renaming its id mid-history would
+                        # be vanishingly unlikely, and the current id is the right label anyway.
+                        r["balToolId"] = tool_ids.get((r["org"], r["name"])) or r["name"]
+                        # No module-{org}-{name} guess for tools (confirmed useless - see module
+                        # docstring) - only the authoritative sourceCodeLocation is used, skipping
+                        # resolve_package_repo's guess ladder entirely rather than wasting two
+                        # 404s per tool on it.
+                        # TODO(tools-trivyignore): repo is captured here (sourceCodeLocation only)
+                        # but nothing consumes it yet - combine.py's process_central_tool_dir
+                        # deliberately does no accepted-risk lookup. Populated now so the deferred
+                        # per-tool .trivyignore work has the data waiting when it resumes.
+                        src = r.get("sourceCodeLocation")
+                        r["repo"] = src.rstrip("/") if src else None
+                    else:
+                        r["repo"] = resolve_package_repo(r["org"], r["name"], r.get("sourceCodeLocation"))
                     resolved.append(r)
 
     print(
