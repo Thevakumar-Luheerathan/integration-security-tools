@@ -12,6 +12,17 @@ function displayName(user) {
   return user?.username || user?.email || user?.given_name || user?.name || null;
 }
 
+// Tab list is data-driven rather than a ternary so adding a source is one entry, not a branch.
+// Each entry maps 1:1 onto a dashboard-backend /api/summary field, all three of which are the
+// SAME PackageSummary[] shape (see aggregate.bal) - so one PackageTable renders all of them: a
+// plugin and a tool are each structurally a package, one row sub-grouped by build variant with
+// CVEs nested under that.
+const TABS = [
+  {key: "packages", label: "Packages", dataKey: "byPackage"},
+  {key: "plugins", label: "Plugins", dataKey: "byPlugin"},
+  {key: "tools", label: "Tools", dataKey: "byTool"},
+];
+
 function formatTimestamp(iso) {
   if (!iso) return "unknown";
   try {
@@ -31,6 +42,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [activeTab, setActiveTab] = useState("packages");
+  const activeTabDef = TABS.find((t) => t.key === activeTab) ?? TABS[0];
 
   const load = useCallback(async () => {
     try {
@@ -139,30 +151,25 @@ function App() {
 
           <section className="findings">
             <div className="findings-tabs" role="tablist">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "packages"}
-                className={`findings-tab${activeTab === "packages" ? " active" : ""}`}
-                onClick={() => setActiveTab("packages")}
-              >
-                Packages <span className="findings-tab-count">{data.byPackage.length}</span>
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "plugins"}
-                className={`findings-tab${activeTab === "plugins" ? " active" : ""}`}
-                onClick={() => setActiveTab("plugins")}
-              >
-                Plugins <span className="findings-tab-count">{data.byPlugin.length}</span>
-              </button>
+              {TABS.map((t) => (
+                <button
+                  key={t.key}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === t.key}
+                  className={`findings-tab${activeTab === t.key ? " active" : ""}`}
+                  onClick={() => setActiveTab(t.key)}
+                >
+                  {t.label} <span className="findings-tab-count">{(data[t.dataKey] ?? []).length}</span>
+                </button>
+              ))}
             </div>
-            {activeTab === "packages" ? (
-              <PackageTable byPackage={data.byPackage} heading="Packages" />
-            ) : (
-              <PackageTable byPackage={data.byPlugin} heading="Plugins" />
-            )}
+            {/* ?? [] is load-bearing, not defensive noise: the dashboard and dashboard-backend
+                are separate Choreo components deployed independently, so this frontend can and
+                will run for a while against a backend whose /api/summary has no byTool field
+                yet. Without the fallback that's a hard crash of the whole findings section, not
+                a missing tab. */}
+            <PackageTable byPackage={data[activeTabDef.dataKey] ?? []} heading={activeTabDef.label} />
           </section>
         </>
       )}
